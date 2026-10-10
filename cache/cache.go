@@ -48,7 +48,7 @@ func normalize(q string) string {
 	return strings.Join(strings.Fields(strings.ToLower(q)), " ")
 }
 
-// Memory is an in-process Cache, for tests and --no-cache style runs.
+// Memory is an in-process Cache, for tests and runs that keep nothing.
 type Memory struct {
 	mu     sync.Mutex
 	m      map[Key]float64

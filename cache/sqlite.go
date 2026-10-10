@@ -54,19 +54,17 @@ type SQLite struct {
 	model string
 }
 
-// Dir is the folder holding cache databases: $JREP_CACHE_DIR, or jrep
-// inside the user cache folder (~/Library/Caches/jrep on macOS). It is
-// jrep's folder on purpose: the keys match, so an answer either one paid
-// for serves both.
+// Dir is the folder holding cache databases: $JINTER_CACHE_DIR, or jinter
+// inside the user cache folder (~/Library/Caches/jinter on macOS).
 func Dir() (string, error) {
-	if d := os.Getenv("JREP_CACHE_DIR"); d != "" {
+	if d := os.Getenv("JINTER_CACHE_DIR"); d != "" {
 		return d, nil
 	}
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "jrep"), nil
+	return filepath.Join(base, "jinter"), nil
 }
 
 // Path is the database file for the repo at root.

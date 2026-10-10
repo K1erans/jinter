@@ -1,4 +1,4 @@
-// Package prefilter is the optional -s keyword pre-pass: a local,
+// Package prefilter is the optional keyword pre-pass: a local,
 // case-insensitive match that decides which chunks are worth sending to Jev.
 package prefilter
 

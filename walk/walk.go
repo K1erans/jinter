@@ -92,7 +92,7 @@ func Walk(paths []string, opts Options) (Result, error) {
 		below = filepath.ToSlash(below)
 		// Generated files are dropped unopened: an unignored node_modules
 		// can hold hundreds of thousands. A test among them is still
-		// generated, so --tests doesn't bring it back.
+		// generated, so Options.Tests doesn't bring it back.
 		if IsGenerated(below) {
 			res.Generated++
 			return

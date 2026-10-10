@@ -1,8 +1,8 @@
 // Package jinter searches code by what it does, using TypeSafe's Jev model.
-// It is jrep's search engine without the command line: Search walks the
-// paths, splits files into chunks, asks Jev about each chunk (reusing cached
-// answers) and ranks the results. The packages below it (walk, chunk,
-// prefilter, jev, cache, search) can also be used on their own.
+// Search walks the paths, splits files into chunks, asks Jev about each
+// chunk (reusing cached answers) and ranks the results. The packages below
+// it (walk, chunk, prefilter, jev, cache, search) can also be used on their
+// own.
 package jinter
 
 import (

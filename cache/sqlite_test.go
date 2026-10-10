@@ -130,11 +130,11 @@ func TestPathAndClear(t *testing.T) {
 
 // TestHelperWriter is run as a child process by TestSeveralProcessesShareOneDatabase.
 func TestHelperWriter(t *testing.T) {
-	path := os.Getenv("JREP_CACHE_HELPER_DB")
+	path := os.Getenv("JINTER_CACHE_HELPER_DB")
 	if path == "" {
 		t.Skip("helper process only")
 	}
-	id, _ := strconv.Atoi(os.Getenv("JREP_CACHE_HELPER_ID"))
+	id, _ := strconv.Atoi(os.Getenv("JINTER_CACHE_HELPER_ID"))
 	c := open(t, path, "m")
 	defer c.Close()
 	for i := range 300 {
@@ -157,7 +157,7 @@ func TestSeveralProcessesShareOneDatabase(t *testing.T) {
 	cmds := make([]*exec.Cmd, procs)
 	for p := range procs {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperWriter$", "-test.count=1")
-		cmd.Env = append(os.Environ(), "JREP_CACHE_HELPER_DB="+path, fmt.Sprintf("JREP_CACHE_HELPER_ID=%d", p+1))
+		cmd.Env = append(os.Environ(), "JINTER_CACHE_HELPER_DB="+path, fmt.Sprintf("JINTER_CACHE_HELPER_ID=%d", p+1))
 		var out bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &out
 		if err := cmd.Start(); err != nil {

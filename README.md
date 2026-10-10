@@ -1,7 +1,6 @@
 # jinter
 
-jrep's search engine as a Go library: it finds code by what it *does*,
-using TypeSafe's Jev model.
+A Go library that finds code by what it *does*, using TypeSafe's Jev model.
 
 ```go
 e := jinter.New(os.Getenv("TYPESAFE_API_KEY"), jev.HTTPOptions{})
@@ -38,12 +37,13 @@ callers can tell the user.
 
 ## Notes
 
-- The on-disk cache is jrep's (`~/Library/Caches/jrep`, or `$JREP_CACHE_DIR`).
-  The keys match, so answers paid for by either serve both.
+- Answers and chunk layouts are cached on disk, one SQLite database per
+  repository (shared by its worktrees), in `~/Library/Caches/jinter` on
+  macOS. `$JINTER_CACHE_DIR` overrides the folder.
 - `Query.MaxFileSize` of 0 means the 1 MB default; use a negative value for
   no limit.
 - By default every tree-sitter grammar is embedded (~33 MB). To embed only
-  common ones, build with jrep's tags, e.g.
-  `-tags 'grammar_subset grammar_subset_go grammar_subset_python …'` (see
-  jrep's Makefile).
+  common ones (~20 MB), build with
+  `-tags 'grammar_subset grammar_subset_go grammar_subset_python …'`, one
+  `grammar_subset_<language>` tag per language to keep.
 - Every chunk searched is sent to TypeSafe.

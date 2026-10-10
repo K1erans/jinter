@@ -251,12 +251,12 @@ func TestTestFilesAreSkippedUnlessAsked(t *testing.T) {
 
 	res, _ = Walk([]string{"feed_test.go"}, Options{})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"feed_test.go"}) {
-		t.Fatalf("a test file named on the command line is searched: %v", got)
+		t.Fatalf("a test file named explicitly is searched: %v", got)
 	}
 
 	res, _ = Walk([]string{"web/__tests__", "testdata"}, Options{})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"testdata/feed.xml", "web/__tests__/a.js"}) {
-		t.Fatalf("a test folder named on the command line is searched: %v", got)
+		t.Fatalf("a test folder named explicitly is searched: %v", got)
 	}
 }
 
@@ -320,7 +320,7 @@ func TestGeneratedFilesAreSkippedUnlessNamed(t *testing.T) {
 		"logo.svg":                   "<svg/>\n",
 		"node_modules/dep/a.js":      "x\n",
 		"web/node_modules/b.js":      "x\n",
-		"node_modules/dep/test/a.js": "x\n", // generated, not a test: --tests wouldn't bring it back
+		"node_modules/dep/test/a.js": "x\n", // generated, not a test: Options.Tests wouldn't bring it back
 		"ICON.SVG":                   "<svg/>\n",
 		"src/sitemap.go":             "package src\n", // .map only as a suffix of a source map
 		"src/lockfile.go":            "package src\n",
@@ -343,7 +343,7 @@ func TestGeneratedFilesAreSkippedUnlessNamed(t *testing.T) {
 
 	res, _ = Walk([]string{"package-lock.json", "node_modules/dep"}, Options{Tests: true})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"node_modules/dep/a.js", "node_modules/dep/test/a.js", "package-lock.json"}) {
-		t.Fatalf("generated files named on the command line are searched: %v", got)
+		t.Fatalf("generated files named explicitly are searched: %v", got)
 	}
 }
 
@@ -377,7 +377,7 @@ func TestDocsAreSkippedUnlessAsked(t *testing.T) {
 
 	res, _ = Walk([]string{"README.md"}, Options{})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"README.md"}) {
-		t.Fatalf("a doc named on the command line is searched: %v", got)
+		t.Fatalf("a doc named explicitly is searched: %v", got)
 	}
 }
 
@@ -451,6 +451,6 @@ func TestTranslationsAreSkippedUnlessNamed(t *testing.T) {
 
 	res, _ = Walk([]string{"internal/locale/translations", "po/nl.po"}, Options{})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"internal/locale/translations/de.json", "po/nl.po"}) {
-		t.Fatalf("translations named on the command line are searched: %v", got)
+		t.Fatalf("translations named explicitly are searched: %v", got)
 	}
 }
