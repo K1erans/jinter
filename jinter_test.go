@@ -3,8 +3,10 @@ package jinter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -127,8 +129,8 @@ func TestPrepassAndRefineNarrowWhatJevIsAskedAbout(t *testing.T) {
 	ctx := context.Background()
 
 	rep, err := e.Search(ctx, Query{Questions: []string{"sends email"}, Prepass: true, Keywords: "smtp"})
-	if err != nil || rep.Chunks != 1 {
-		t.Fatalf("prepass: err %v, chunks %d", err, rep.Chunks)
+	if err != nil || rep.Chunks != 1 || rep.Split != 2 || rep.Keywords != "smtp" {
+		t.Fatalf("prepass: err %v, chunks %d of %d, keywords %q", err, rep.Chunks, rep.Split, rep.Keywords)
 	}
 
 	if _, err := e.Search(ctx, Query{Questions: []string{"retries failed payments"}}); err != nil {
@@ -193,5 +195,24 @@ func TestAboutTests(t *testing.T) {
 		if got := AboutTests([]string{q}); got != want {
 			t.Errorf("AboutTests(%q) = %v, want %v", q, got, want)
 		}
+	}
+}
+
+func TestSkippedFilesAreReportedBeforeJevIsAsked(t *testing.T) {
+	project(t, billing)
+	e, _ := engine(scorer())
+	var events []string
+	_, err := e.Search(context.Background(), Query{
+		Questions: []string{"retries failed payments"},
+		OnFiles: func(r Report) {
+			events = append(events, fmt.Sprintf("files: %d tests skipped", r.Tests))
+		},
+		OnAsk: func(n int) { events = append(events, fmt.Sprintf("ask: %d", n)) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"files: 1 tests skipped", "ask: 2"}; !slices.Equal(events, want) {
+		t.Fatalf("got %q, want %q", events, want)
 	}
 }

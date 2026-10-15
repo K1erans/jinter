@@ -113,6 +113,11 @@ type Query struct {
 	// OnCacheError hears about cache failures, which don't stop a search.
 	OnCacheError func(error)
 
+	// OnFiles hears which files were left out as soon as they are listed,
+	// before any chunk is sent to Jev, so callers can say so up front. Only
+	// Repo, TestsIncluded and the skipped files are set.
+	OnFiles func(Report)
+
 	// OnAsk hears how many chunks are about to be sent to Jev, when any are.
 	OnAsk func(chunks int)
 }
@@ -122,6 +127,11 @@ type Report struct {
 	Results []search.Result // one per distinct question, in order
 	Repo    string          // the repository searched, as used for its cache
 	Chunks  int             // chunks searched, after Prepass and Refine
+	Split   int             // chunks the files split into, before Prepass and Refine
+
+	// Keywords is the pattern Prepass kept chunks by: Query.Keywords, or
+	// the one built from the questions.
+	Keywords string
 
 	// TestsIncluded is set when test files were searched because a question
 	// was about tests, without Query.Tests.
@@ -179,6 +189,9 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		Translations:  files.Translations,
 		Docs:          files.Docs,
 	}
+	if q.OnFiles != nil {
+		q.OnFiles(rep)
+	}
 
 	open := e.OpenCache
 	if open == nil {
@@ -200,11 +213,13 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 	if err != nil {
 		return rep, err
 	}
+	rep.Split = len(chunks)
 	if q.Prepass {
 		f, err := prefilter.New(q.Keywords, q.Questions)
 		if err != nil {
 			return rep, fmt.Errorf("prepass: %w", err)
 		}
+		rep.Keywords = f.Pattern()
 		kept := chunks[:0:0]
 		for _, c := range chunks {
 			if f.Keep(c.Code) {
