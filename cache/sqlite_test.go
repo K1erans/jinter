@@ -108,23 +108,11 @@ func TestCleanupDropsStaleAndOtherModelRowsOnceADay(t *testing.T) {
 	}
 }
 
-func TestPathAndClear(t *testing.T) {
+func TestPath(t *testing.T) {
 	dir := t.TempDir()
 	a, b := Path(dir, "/src/one"), Path(dir, "/src/two")
 	if a == b || a != Path(dir, "/src/one") || filepath.Dir(a) != dir {
 		t.Fatalf("paths %s %s", a, b)
-	}
-	c := open(t, a, "m")
-	c.Put(key(1), 0.5)
-	c.Close()
-	if err := Clear(a); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(a); !os.IsNotExist(err) {
-		t.Fatalf("database still there: %v", err)
-	}
-	if err := Clear(a); err != nil {
-		t.Fatalf("clearing a missing cache is fine: %v", err)
 	}
 }
 

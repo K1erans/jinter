@@ -19,7 +19,7 @@ for _, r := range rep.Results {
 
 `Search` runs the whole pipeline: walk (following `.gitignore`, skipping
 binaries, generated files, translations, and tests and docs unless asked),
-chunk with tree-sitter, an optional keyword pre-pass, an optional `Refine`,
+chunk with tree-sitter,
 then cached Jev calls and ranking. The `Report` says what was skipped so
 callers can tell the user.
 
@@ -30,10 +30,9 @@ callers can tell the user.
 | `jinter` | `Engine.Search`: the pipeline end to end |
 | `walk` | file listing, gitignore, binary/generated/test/doc detection |
 | `chunk` | splitting files into function-sized chunks |
-| `prefilter` | the keyword pre-pass |
 | `jev` | Jev API client, adaptive rate limiter, retries; `jevtest.Fake` for offline tests |
 | `cache` | SQLite and in-memory caches of answers and chunk layouts |
-| `search` | `Load` (chunk with cached layouts), `Run` (key → cache → Jev → rank), `Narrow` |
+| `search` | `Load` (chunk with cached layouts), `Run` (key → cache → Jev → rank) |
 
 ## Notes
 

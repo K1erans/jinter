@@ -259,35 +259,3 @@ func TestAnswersSurviveCodeMovingWithinItsFile(t *testing.T) {
 		t.Fatalf("results show the new lines, got %d-%d", m.Start, m.End)
 	}
 }
-
-func TestNarrowKeepsTheChunksThatBestMatchedAnEarlierQuestion(t *testing.T) {
-	store := cache.NewMemory()
-	fake := &jevtest.Fake{Score: scores(paymentScores)}
-	if _, err := Run(context.Background(), chunks(), fake, store, opts("retries failed payments")); err != nil {
-		t.Fatal(err)
-	}
-	got, err := Narrow(chunks(), store, "jev-1.13.0", "Retries  FAILED payments", 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := chunks()[:2]; !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v\nwant the two best, in file order", got)
-	}
-
-	// A chunk the earlier question never saw isn't searched again.
-	added := append(chunks(), Chunk{Path: "src/new.ts", Rel: "app/src/new.ts", Chunk: chunk.Chunk{Start: 1, End: 3, Code: "new"}})
-	if got, _ := Narrow(added, store, "jev-1.13.0", "retries failed payments", 10); !reflect.DeepEqual(got, chunks()) {
-		t.Fatalf("got %+v", got)
-	}
-	if len(fake.Requests()) != 3 {
-		t.Fatal("narrowing reads the cache only")
-	}
-}
-
-func TestNarrowingByAQuestionNeverAskedIsAnError(t *testing.T) {
-	store := cache.NewMemory()
-	Run(context.Background(), chunks(), &jevtest.Fake{Score: scores(paymentScores)}, store, opts("retries failed payments"))
-	if _, err := Narrow(chunks(), store, "jev-1.13.0", "sends email", 2); !errors.Is(err, ErrNotAsked) {
-		t.Fatalf("got %v, want ErrNotAsked", err)
-	}
-}

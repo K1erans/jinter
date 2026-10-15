@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -71,17 +70,6 @@ func Dir() (string, error) {
 func Path(dir, root string) string {
 	sum := sha256.Sum256([]byte(root))
 	return filepath.Join(dir, hex.EncodeToString(sum[:])+".db")
-}
-
-// Clear deletes the database at path and its WAL files.
-func Clear(path string) error {
-	var errs []error
-	for _, p := range []string{path, path + "-wal", path + "-shm"} {
-		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
 }
 
 // Open opens or creates the database at path. model is the version being

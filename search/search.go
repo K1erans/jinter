@@ -206,43 +206,6 @@ func keyAll(chunks []Chunk, model string, instructions []string) ([]cache.Key, e
 	return keys, errors.Join(errs...)
 }
 
-// ErrNotAsked means no chunk has a cached answer for the question.
-var ErrNotAsked = errors.New("no cached answers")
-
-// Narrow keeps the n chunks that scored best for an earlier question, in
-// their original order, reading only cached answers. It makes retrying a
-// reworded question cheap: replaying 24 rewordings of 12 tasks, the right
-// chunk was always in the earlier question's top 11, and asking the new
-// wording about only those ranked it as well as a full scan did. Chunks
-// with no cached answer are left out: the earlier search never saw them.
-func Narrow(chunks []Chunk, store cache.Cache, model, question string, n int) ([]Chunk, error) {
-	keys, err := keyAll(chunks, model, []string{jev.Instruction(question)})
-	if err != nil {
-		return nil, err
-	}
-	hits, err := store.Get(keys)
-	if err != nil {
-		return nil, fmt.Errorf("reading cache: %w", err)
-	}
-	var answered []int
-	for i, k := range keys {
-		if _, ok := hits[k]; ok {
-			answered = append(answered, i)
-		}
-	}
-	if len(answered) == 0 {
-		return nil, ErrNotAsked
-	}
-	slices.SortStableFunc(answered, func(a, b int) int { return cmp.Compare(hits[keys[b]], hits[keys[a]]) })
-	answered = answered[:min(n, len(answered))]
-	slices.Sort(answered)
-	kept := make([]Chunk, len(answered))
-	for j, i := range answered {
-		kept[j] = chunks[i]
-	}
-	return kept, nil
-}
-
 // parallel runs fn over items with n workers and stops at the first error.
 func parallel[T any](ctx context.Context, items []T, n int, fn func(context.Context, T) error) error {
 	ctx, cancel := context.WithCancelCause(ctx)

@@ -1,7 +1,7 @@
 // Package jinter searches code by what it does, using TypeSafe's Jev model.
 // Search walks the paths, splits files into chunks, asks Jev about each
 // chunk (reusing cached answers) and ranks the results. The packages below
-// it (walk, chunk, prefilter, jev, cache, search) can also be used on their
+// it (walk, chunk, jev, cache, search) can also be used on their
 // own.
 package jinter
 
@@ -10,13 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
-	"unicode"
 
 	"github.com/K1erans/jinter/cache"
 	"github.com/K1erans/jinter/chunk"
 	"github.com/K1erans/jinter/jev"
-	"github.com/K1erans/jinter/prefilter"
 	"github.com/K1erans/jinter/search"
 	"github.com/K1erans/jinter/walk"
 )
@@ -27,16 +24,6 @@ const DefaultModel = "jev-1.13.0"
 // DefaultMaxFileSize skips files over 1 MB: almost always bundles, lockfiles
 // or data dumps, and expensive to send.
 const DefaultMaxFileSize = 1 << 20
-
-// DefaultRefineTop is how many chunks Query.Refine searches. Replaying 24
-// rewordings of 12 miniflux tasks, the right chunk was always in the earlier
-// question's top 11 and kept its rank with only the top 30 searched; 300
-// leaves room for bigger repos at about 9% of that 3,400-chunk scan.
-const DefaultRefineTop = 300
-
-// ErrNotAsked means Query.Refine named a question with no cached answers
-// over these files.
-var ErrNotAsked = search.ErrNotAsked
 
 // Engine holds what a search talks to.
 type Engine struct {
@@ -70,41 +57,16 @@ func DiskCache(repo, model string) (cache.Cache, func() error, error) {
 	return c, c.Close, nil
 }
 
-// ClearCache deletes the on-disk cache of the repository holding path.
-func ClearCache(path string) error {
-	repo, err := walk.Repo(path)
-	if err != nil {
-		return err
-	}
-	dir, err := cache.Dir()
-	if err != nil {
-		return err
-	}
-	return cache.Clear(cache.Path(dir, repo))
-}
-
 // Query is one search. Zero values take the defaults noted.
 type Query struct {
 	Questions []string // answered in the same Jev calls, so extra ones are nearly free
 	Paths     []string // files and folders to search; default "."
 
-	// Prepass sends only chunks matching Keywords to Jev: faster and
-	// cheaper, but misses code that uses other words. Keywords is a regexp;
-	// empty means the questions' words minus common stopwords.
-	Prepass  bool
-	Keywords string
-
-	// Refine retries a reworded question cheaply: only the RefineTop chunks
-	// that best matched this earlier question (from its cached answers) are
-	// searched. RefineTop defaults to DefaultRefineTop.
-	Refine    string
-	RefineTop int
-
 	Threshold float64 // minimum probability to count as a match
 	Top       int     // maximum matches per question; 0 means no limit
 
 	NoIgnore    bool  // also search gitignored files
-	Tests       bool  // also search tests; on by itself when a question is about tests
+	Tests       bool  // also search tests
 	Docs        bool  // also search documentation
 	MaxFileSize int64 // default DefaultMaxFileSize; negative means no limit
 	Model       string
@@ -121,11 +83,7 @@ type Query struct {
 type Report struct {
 	Results []search.Result // one per distinct question, in order
 	Repo    string          // the repository searched, as used for its cache
-	Chunks  int             // chunks searched, after Prepass and Refine
-
-	// TestsIncluded is set when test files were searched because a question
-	// was about tests, without Query.Tests.
-	TestsIncluded bool
+	Chunks  int             // chunks searched
 
 	// Files skipped, so callers can say so: nothing is skipped silently.
 	Oversize     []walk.File
@@ -165,19 +123,17 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		}
 	}
 
-	tests := q.Tests || AboutTests(q.Questions)
-	files, err := walk.Walk(paths, walk.Options{NoIgnore: q.NoIgnore, Tests: tests, Docs: q.Docs, MaxFileSize: maxSize})
+	files, err := walk.Walk(paths, walk.Options{NoIgnore: q.NoIgnore, Tests: q.Tests, Docs: q.Docs, MaxFileSize: maxSize})
 	if err != nil {
 		return Report{}, err
 	}
 	rep := Report{
-		Repo:          files.Repo,
-		TestsIncluded: tests && !q.Tests,
-		Oversize:      files.Oversize,
-		Tests:         files.Tests,
-		Generated:     files.Generated,
-		Translations:  files.Translations,
-		Docs:          files.Docs,
+		Repo:         files.Repo,
+		Oversize:     files.Oversize,
+		Tests:        files.Tests,
+		Generated:    files.Generated,
+		Translations: files.Translations,
+		Docs:         files.Docs,
 	}
 
 	open := e.OpenCache
@@ -199,25 +155,6 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 	})
 	if err != nil {
 		return rep, err
-	}
-	if q.Prepass {
-		f, err := prefilter.New(q.Keywords, q.Questions)
-		if err != nil {
-			return rep, fmt.Errorf("prepass: %w", err)
-		}
-		kept := chunks[:0:0]
-		for _, c := range chunks {
-			if f.Keep(c.Code) {
-				kept = append(kept, c)
-			}
-		}
-		chunks = kept
-	}
-	if q.Refine != "" {
-		chunks, err = search.Narrow(chunks, store, model, q.Refine, cmp.Or(q.RefineTop, DefaultRefineTop))
-		if err != nil {
-			return rep, fmt.Errorf("refine %q: %w", q.Refine, err)
-		}
 	}
 	rep.Chunks = len(chunks)
 
@@ -243,36 +180,4 @@ type noClient struct{}
 
 func (noClient) Ask(context.Context, jev.Request) (jev.Response, error) {
 	return jev.Response{}, errors.New("no Jev client: set Engine.Client to ask about uncached chunks")
-}
-
-// testWords in a question mean it is looking for tests, which are
-// otherwise skipped. "spec" is left out, as API specs are production code.
-var testWords = map[string]bool{
-	"test": true, "tests": true, "testing": true, "unittest": true, "unittests": true,
-	"testdata": true, "fixture": true, "fixtures": true, "mock": true, "mocks": true, "mocked": true,
-}
-
-// AboutTests reports whether any question asks about tests: "the tests
-// for retries", "mocks the payment client". "tests" followed by whether or
-// if is a verb, as in "tests whether the token expired", which asks about
-// production code.
-func AboutTests(questions []string) bool {
-	for _, q := range questions {
-		words := strings.FieldsFunc(strings.ToLower(q), func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-		})
-		for i, w := range words {
-			if !testWords[w] {
-				continue
-			}
-			if i+1 < len(words) && strings.HasPrefix(w, "test") {
-				switch words[i+1] {
-				case "whether", "if":
-					continue
-				}
-			}
-			return true
-		}
-	}
-	return false
 }

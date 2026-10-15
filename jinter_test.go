@@ -78,19 +78,19 @@ func TestSearchRanksMatchesForEveryQuestion(t *testing.T) {
 	if r := rep.Results[2]; len(r.Matches) != 0 || r.Best == nil || r.Best.Probability != 0.1 {
 		t.Fatalf("yaml: %+v", r)
 	}
-	if rep.Tests != 1 || rep.TestsIncluded {
-		t.Fatalf("tests skipped %d, included %v", rep.Tests, rep.TestsIncluded)
+	if rep.Tests != 1 {
+		t.Fatalf("tests skipped %d", rep.Tests)
 	}
 }
 
-func TestAQuestionAboutTestsSearchesTestFiles(t *testing.T) {
+func TestTestsSearchesTestFiles(t *testing.T) {
 	project(t, billing)
 	e, _ := engine(scorer())
-	rep, err := e.Search(context.Background(), Query{Questions: []string{"the tests for payment retries"}, Threshold: 0.6})
+	rep, err := e.Search(context.Background(), Query{Questions: []string{"the tests for payment retries"}, Threshold: 0.6, Tests: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rep.TestsIncluded || rep.Tests != 0 {
+	if rep.Tests != 0 {
 		t.Fatalf("report %+v", rep)
 	}
 	if m := rep.Results[0].Matches; len(m) != 1 || m[0].Path != "src/billing/retry_test.go" {
@@ -120,35 +120,6 @@ func TestRepeatSearchIsServedFromCacheWithoutAClient(t *testing.T) {
 	}
 }
 
-func TestPrepassAndRefineNarrowWhatJevIsAskedAbout(t *testing.T) {
-	project(t, billing)
-	fake := scorer()
-	e, _ := engine(fake)
-	ctx := context.Background()
-
-	rep, err := e.Search(ctx, Query{Questions: []string{"sends email"}, Prepass: true, Keywords: "smtp"})
-	if err != nil || rep.Chunks != 1 {
-		t.Fatalf("prepass: err %v, chunks %d", err, rep.Chunks)
-	}
-
-	if _, err := e.Search(ctx, Query{Questions: []string{"retries failed payments"}}); err != nil {
-		t.Fatal(err)
-	}
-	rep, err = e.Search(ctx, Query{Questions: []string{"charges a failed payment again"}, Refine: "retries failed payments", RefineTop: 1})
-	if err != nil || rep.Chunks != 1 {
-		t.Fatalf("refine: err %v, chunks %d", err, rep.Chunks)
-	}
-	last := fake.Requests()[len(fake.Requests())-1]
-	if last.Path != "src/billing/retry.go" {
-		t.Fatalf("refine asked about %s", last.Path)
-	}
-
-	_, err = e.Search(ctx, Query{Questions: []string{"x"}, Refine: "never asked"})
-	if !errors.Is(err, ErrNotAsked) {
-		t.Fatalf("refine by an unasked question: %v", err)
-	}
-}
-
 func TestUnusableCacheIsReportedButSearches(t *testing.T) {
 	project(t, billing)
 	e := &Engine{Client: scorer(), OpenCache: func(string, string) (cache.Cache, func() error, error) {
@@ -173,25 +144,5 @@ func TestJevErrorsAreReturned(t *testing.T) {
 	e, _ := engine(&jevtest.Fake{Err: errors.New("401 invalid API key")})
 	if _, err := e.Search(context.Background(), Query{Questions: []string{"retries failed payments"}}); err == nil || !strings.Contains(err.Error(), "invalid API key") {
 		t.Fatalf("err %v", err)
-	}
-}
-
-func TestAboutTests(t *testing.T) {
-	for q, want := range map[string]bool{
-		"the test that covers retries":    true,
-		"tests for the payment client":    true,
-		"tests whether the token expired": false,
-		"testing if a port is free":       false,
-		"test helpers that build users":   true,
-		"mocks the payment client":        true,
-		"loads fixtures for the db":       true,
-		"retries failed payments":         false,
-		"parses the openapi spec":         false,
-		"latest attestation is verified":  false,
-		"where retry_test checks backoff": true,
-	} {
-		if got := AboutTests([]string{q}); got != want {
-			t.Errorf("AboutTests(%q) = %v, want %v", q, got, want)
-		}
 	}
 }
