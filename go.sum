@@ -1,3 +1,5 @@
+github.com/K1erans/tsasm v0.0.0-20261122161319-ef201d02577e h1:/4sKZrt16/zI5wLQn9jD8kBxGO1evRUO94dyt0r4PSc=
+github.com/K1erans/tsasm v0.0.0-20261122161319-ef201d02577e/go.mod h1:SWZCcmKkjWtXe370J2Tnhd9xM5Bj9Bl9G0qugPvaIxc=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

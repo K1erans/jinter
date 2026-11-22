@@ -215,18 +215,18 @@ and HTML. Route languages to it with `$JINTER_PARSER` or
 `'*=c'` for every language it has; the rest stay on gotreesitter. A
 non-default routing gets its own cached chunk layouts.
 
-With `-tags jinter_tsasm` on linux/amd64, jinter also has tsasm, a
-tree-sitter parser runtime in x86-64 assembly, for Go, C, Java and JSON.
+With `-tags jinter_tsasm` on linux/amd64, jinter also has
+[tsasm](https://github.com/K1erans/tsasm), a tree-sitter parser runtime
+in x86-64 assembly, for Go, C, Java and JSON.
 It reads the same official grammars as the C backend, so where a file
 parses, the trees are the same. It has no error recovery: a file with
 syntax errors gets no tree, and jinter splits it as plain text, as it
 does a tree with errors. Its trees have no grammar fields or highlight
-captures, which chunking doesn't use. tsasm isn't a Go module: build its
-`libtsasm.a` and point cgo at its directory when building the program
-that uses jinter, then route to it:
+captures, which chunking doesn't use. Like the C backend it needs cgo and
+a C compiler, which assembles it; then route to it:
 
 ```
-CGO_LDFLAGS=-L$HOME/src/tsasm go build -tags jinter_tsasm .
+go build -tags jinter_tsasm .
 JINTER_PARSER='*=tsasm' ./yourprogram
 ```
 

@@ -1,11 +1,10 @@
 // Command parsebench compares the parse backends on real code: speed on
 // one thread and on all of them, whether their trees agree, and how often
 // each fails. Build it with -tags jinter_cgo to compare C tree-sitter with
-// gotreesitter, and add jinter_tsasm for tsasm (its library's directory in
-// CGO_LDFLAGS):
+// gotreesitter, and add jinter_tsasm for tsasm:
 //
 //	go run -tags jinter_cgo ./internal/parsebench ~/src/repo-a ~/src/repo-b
-//	CGO_LDFLAGS=-L$TSASM go run -tags 'jinter_cgo jinter_tsasm' ./internal/parsebench .
+//	go run -tags 'jinter_cgo jinter_tsasm' ./internal/parsebench .
 //
 // It parses the files jinter would search (gitignore respected, test files
 // included), grouped by language, and prints a Markdown table.
