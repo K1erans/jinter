@@ -355,3 +355,49 @@ func TestSplitIsSafeForConcurrentUse(t *testing.T) {
 		}
 	}
 }
+
+func TestSignatureCutsAtMaxSignatureRunes(t *testing.T) {
+	// The old code converted the whole line to runes; this pins the result it gave.
+	old := func(line string) string {
+		line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), "{"))
+		if r := []rune(line); len(r) > maxSignature {
+			return string(r[:maxSignature-1]) + "…"
+		}
+		return line
+	}
+	for _, line := range []string{
+		"",
+		"func f() {",
+		strings.Repeat("a", maxSignature-1),
+		strings.Repeat("a", maxSignature),
+		strings.Repeat("a", maxSignature+1),
+		strings.Repeat("é", maxSignature),
+		strings.Repeat("é", maxSignature+1),
+		strings.Repeat("日本", 300) + " {",
+		`"key": "` + strings.Repeat("\\\\d+", 50000) + `",`,
+	} {
+		s := splitter{lines: []string{line}}
+		if got, want := s.signature(0, 0), old(line); got != want {
+			t.Errorf("line of %d bytes: got %q, want %q", len(line), got, want)
+		}
+	}
+}
+
+// One 2 MB line holding 20,000 nodes took minutes when every node's signature
+// rescanned the whole line.
+func TestLongLinesDoNotMakeSignaturesQuadratic(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("[")
+	for i := range 20000 {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, `{"k%d": "%s"}`, i, strings.Repeat("x", 80))
+	}
+	b.WriteString("]\n")
+	start := time.Now()
+	Split("long.json", []byte(b.String()), Default)
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("splitting one long line took %v", d)
+	}
+}

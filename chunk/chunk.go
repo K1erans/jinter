@@ -358,8 +358,16 @@ func (s splitter) signature(start, end int) string {
 		}
 	}
 	first = strings.TrimSpace(strings.TrimSuffix(first, "{"))
-	if utf8.RuneCountInString(first) > maxSignature {
-		first = string([]rune(first)[:maxSignature-1]) + "…"
+	n, cut := 0, 0
+	for i := range first {
+		if n == maxSignature-1 {
+			cut = i
+		}
+		if n == maxSignature {
+			first = first[:cut] + "…"
+			break
+		}
+		n++
 	}
 	return first
 }
