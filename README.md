@@ -213,3 +213,6 @@ and HTML. Route languages to it with `$JINTER_PARSER` or
 `chunk.Options.Parsers`, e.g. `JINTER_PARSER='typescript=c,tsx=c'`, or
 `'*=c'` for every language it has; the rest stay on gotreesitter. A
 non-default routing gets its own cached chunk layouts.
+
+`go run -tags jinter_cgo ./internal/parsebench <paths>` compares the
+backends on your code: speed, failures, and whether their trees agree.
