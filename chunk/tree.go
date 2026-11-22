@@ -1,123 +1,80 @@
 package chunk
 
 import (
-	"errors"
+	"context"
 	"fmt"
-	"time"
+	"sync"
 
-	gotreesitter "github.com/odvcencio/gotreesitter"
-	"github.com/odvcencio/gotreesitter/grammars"
+	"github.com/K1erans/jinter/parse"
 )
 
-// Language is the tree-sitter grammar for a file.
-type Language struct {
-	Name    string                 // the registry's name, e.g. "go", "typescript", "tsx"
-	Grammar *gotreesitter.Language // what queries and node types are resolved against
-	// HighlightQuery is the grammar's highlights.scm, with the queries it
-	// inherits composed in (TypeScript includes JavaScript's). It is empty
-	// for a grammar that ships none.
-	HighlightQuery string
-	Entry          *grammars.LangEntry // the full registry entry
-}
-
-// Detect finds the grammar for filename, or nil when there is none. It
-// loads the grammar on first use.
-func Detect(filename string) *Language {
-	entry := grammars.DetectLanguage(filename)
-	if entry == nil {
-		return nil
+// Router is the router o.Parsers describes, or parse.Default() (which
+// JINTER_PARSER sets) when it is empty. It fails when o.Parsers can't be
+// used; Split then falls back to parse.Default().
+func (o Options) Router() (*parse.Router, error) {
+	if o.Parsers == "" {
+		return parse.Default(), nil
 	}
-	return &Language{Name: entry.Name, Grammar: entry.Language(), HighlightQuery: entry.HighlightQuery, Entry: entry}
-}
-
-// Tree is a whole file parsed by tree-sitter: the bound tree (its root
-// node, node types and text, and Source) and the grammar it was parsed
-// with. Call Release when done with it, which returns its nodes to the
-// parser's arena; nodes must not be used after that.
-type Tree struct {
-	*gotreesitter.BoundTree
-	Lang *Language
-}
-
-// Why Parse gave no tree. Every one of them means Split cuts the file with
-// its plain indentation splitter instead of at syntax nodes, except Go
-// files, which Split reads with go/parser first and only falls back when
-// that fails too.
-var (
-	// ErrNoGrammar: no tree-sitter grammar matches the file name.
-	ErrNoGrammar = errors.New("chunk: no grammar for file")
-	// ErrTimeout: the parse ran past its timeout. Whether a file beats the
-	// clock depends on how busy the machine is, so the same file can
-	// parse on one run and time out on the next.
-	ErrTimeout = errors.New("chunk: parse timed out")
-	// ErrStoppedEarly: the parser stopped at one of its own limits (on
-	// iterations, stack depth, nodes or memory, which scale with file
-	// size), or failed for another reason, before accepting the file.
-	ErrStoppedEarly = errors.New("chunk: parse stopped early")
-	// ErrSyntax: the parse finished but the tree holds errors, either
-	// because the file is invalid or because the grammar can't read it.
-	ErrSyntax = errors.New("chunk: syntax errors")
-)
-
-// Parse parses src with the tree-sitter grammar for filename, with the
-// same parsers, pools and acceptance rules Split uses, so a file Parse
-// accepts is one Split cuts at syntax nodes (Go files aside: Split reads
-// those with go/parser, but Parse always uses tree-sitter). timeout gives
-// up on a runaway parse, as Options.ParseTimeout does for Split; 0 means
-// no limit.
-//
-// When there is no tree, the error says why and wraps one of ErrNoGrammar,
-// ErrTimeout, ErrStoppedEarly or ErrSyntax.
-func Parse(filename string, src []byte, timeout time.Duration) (*Tree, error) {
-	entry := grammars.DetectLanguage(filename)
-	if entry == nil {
-		return nil, fmt.Errorf("%s: %w", filename, ErrNoGrammar)
+	if r, ok := routers.Load(o.Parsers); ok {
+		return r.(*parse.Router), nil
 	}
-	lang := entry.Language()
-	bt, err := parseEntry(entry, lang, src, timeout)
+	r, err := parse.NewRouter(o.Parsers)
 	if err != nil {
-		return nil, fmt.Errorf("%s (%s): %w", filename, entry.Name, err)
+		return nil, fmt.Errorf("chunk: Options.Parsers: %w", err)
 	}
-	return &Tree{BoundTree: bt, Lang: &Language{Name: entry.Name, Grammar: lang, HighlightQuery: entry.HighlightQuery, Entry: entry}}, nil
+	routers.Store(o.Parsers, r)
+	return r, nil
 }
 
-// parse is Parse for Split, which only needs to know whether there is a
-// tree.
-func parse(filename string, src []byte, timeout time.Duration) (*gotreesitter.BoundTree, bool) {
-	entry := grammars.DetectLanguage(filename)
-	if entry == nil {
+var routers sync.Map // Options.Parsers → *parse.Router
+
+func (o Options) router() *parse.Router {
+	r, err := o.Router()
+	if err != nil {
+		return parse.Default()
+	}
+	return r
+}
+
+// String writes o as %+v would without Parsers, adding the routing only
+// when some language leaves gotreesitter, so the default options print as
+// they did before Parsers existed. search hashes this into its layout keys:
+// layouts cached under the default routing stay valid, and each other
+// routing gets its own.
+func (o Options) String() string {
+	s := fmt.Sprintf("{MinLines:%d MaxLines:%d MaxBytes:%d ParseTimeout:%v", o.MinLines, o.MaxLines, o.MaxBytes, o.ParseTimeout)
+	if r := o.router().String(); r != "" {
+		s += " Parsers:" + r
+	}
+	return s + "}"
+}
+
+// parseFile parses src with the backend o routes filename's language to.
+// It fails, and Split falls back to the plain splitter, when there is no
+// grammar, the parse stops early or times out, or the tree holds syntax
+// errors.
+func (o Options) parseFile(filename string, src []byte) (*parse.Tree, bool) {
+	lang := parse.Detect(filename)
+	if lang == "" {
 		return nil, false
 	}
-	bt, err := parseEntry(entry, entry.Language(), src, timeout)
-	return bt, err == nil
+	t, err := o.router().Parse(context.Background(), lang, src, o.ParseTimeout)
+	if err != nil {
+		return nil, false
+	}
+	if t.Root().HasError() {
+		t.Release()
+		return nil, false
+	}
+	return t, true
 }
 
-// parseEntry parses src with entry's grammar, lang. It fails when the source
-// has syntax errors or the parse stops early: at the parser's own work
-// limits or past timeout.
-func parseEntry(entry *grammars.LangEntry, lang *gotreesitter.Language, src []byte, timeout time.Duration) (*gotreesitter.BoundTree, error) {
-	pool := parserPool(entry.Name, lang, timeout)
-	var tree *gotreesitter.Tree
-	var err error
-	if entry.TokenSourceFactory != nil && !grammarLexer[entry.Name] {
-		tree, err = pool.ParseWithTokenSourceStrict(src, entry.TokenSourceFactory(src, lang))
-	} else {
-		tree, err = pool.ParseStrict(src)
-	}
-	if err != nil {
-		if tree != nil {
-			tree.Release()
+// hasNamedChild reports whether n has a named child.
+func hasNamedChild(n parse.Node) bool {
+	for i := range n.ChildCount() {
+		if n.Child(i).IsNamed() {
+			return true
 		}
-		var stopped *gotreesitter.ParseStoppedEarlyError
-		if errors.As(err, &stopped) && stopped.Reason == gotreesitter.ParseStopTimeout {
-			return nil, fmt.Errorf("%w after %v", ErrTimeout, timeout)
-		}
-		return nil, fmt.Errorf("%w: %v", ErrStoppedEarly, err)
 	}
-	bt := gotreesitter.Bind(tree)
-	if root := bt.RootNode(); root == nil || root.HasError() {
-		bt.Release()
-		return nil, ErrSyntax
-	}
-	return bt, nil
+	return false
 }

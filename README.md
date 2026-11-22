@@ -184,7 +184,8 @@ their own:
 | Package | Does |
 |---|---|
 | [`walk`](walk) | File listing, `.gitignore`, binary, generated, test and doc detection |
-| [`chunk`](chunk) | Splitting files into function-sized chunks; `Parse` returns a file's whole tree-sitter tree and grammar |
+| [`chunk`](chunk) | Splitting files into function-sized chunks |
+| [`parse`](parse) | Syntax trees and highlight captures behind one interface, with the parser chosen per language (`$JINTER_PARSER`) |
 | [`prefilter`](prefilter) | The keyword pre-pass |
 | [`jev`](jev) | Jev API client with an adaptive rate limiter and retries: `Ask` for search's Noul questions, `Decide` for any mix of Noul, Choice and Score questions about one state; `jevtest` fakes both |
 | [`cache`](cache) | SQLite and in-memory caches of answers and chunk layouts |

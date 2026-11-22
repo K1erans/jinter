@@ -73,3 +73,26 @@ func TestSplitMatchesGolden(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkSplitGolden splits every golden file with the default options:
+// mostly tree-sitter parses in a dozen languages.
+func BenchmarkSplitGolden(b *testing.B) {
+	files, _ := filepath.Glob("testdata/golden/*")
+	var names []string
+	var srcs [][]byte
+	size := 0
+	for _, f := range files {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			b.Fatal(err)
+		}
+		names, srcs, size = append(names, filepath.Base(f)), append(srcs, src), size+len(src)
+	}
+	b.SetBytes(int64(size))
+	b.ReportAllocs()
+	for b.Loop() {
+		for i, src := range srcs {
+			Split(names[i], src, Default)
+		}
+	}
+}

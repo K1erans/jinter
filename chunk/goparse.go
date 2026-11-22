@@ -7,14 +7,12 @@ import (
 	"go/token"
 	"slices"
 
-	gotreesitter "github.com/odvcencio/gotreesitter"
-	"github.com/odvcencio/gotreesitter/grammars"
+	"github.com/K1erans/jinter/parse"
 )
 
 // isGo reports whether filename gets tree-sitter's Go grammar.
 func isGo(filename string) bool {
-	e := grammars.DetectLanguage(filename)
-	return e != nil && e.Name == "go"
+	return parse.Detect(filename) == "go"
 }
 
 // goNode is a top-level node of a Go file as tree-sitter sees it: the
@@ -65,16 +63,16 @@ func (s splitter) goCandidates(filename string, src []byte) ([]candidate, route)
 		return firstPerRow(out), routeGo
 	}
 
-	bt, trees, ok := s.parseOnly(filename, src, keep)
+	tree, trees, ok := s.parseOnly(filename, src, keep)
 	if !ok {
 		return nil, routePlain
 	}
-	defer bt.Release()
+	defer tree.Release()
 	var out []candidate
 	k := 0 // nodes[i] is keep[k] if it was kept
 	for _, n := range nodes {
 		if n.big {
-			out = append(out, s.nodeCandidates(bt, trees[k], "")...)
+			out = append(out, s.nodeCandidates(trees[k], "")...)
 		} else {
 			out = append(out, s.leaf(n.typ, n.start, n.end, ""))
 		}
@@ -177,7 +175,7 @@ func (s splitter) row(off int) int {
 //     the copy has a syntax error, such as two kept declarations left on
 //     one line without the semicolon between them, or the parse times out.
 //   - when the copy and src differ in boundaryHints.
-func (s splitter) parseOnly(filename string, src []byte, keep []goNode) (*gotreesitter.BoundTree, []*gotreesitter.Node, bool) {
+func (s splitter) parseOnly(filename string, src []byte, keep []goNode) (*parse.Tree, []parse.Node, bool) {
 	blank := make([]byte, len(src))
 	k := 0
 	for i, b := range src {
@@ -194,22 +192,22 @@ func (s splitter) parseOnly(filename string, src []byte, keep []goNode) (*gotree
 	if boundaryHints(blank) != boundaryHints(src) {
 		return nil, nil, false
 	}
-	bt, ok := parse(filename, blank, s.opts.ParseTimeout)
+	tree, ok := s.opts.parseFile(filename, blank)
 	if !ok {
 		return nil, nil, false
 	}
-	nodes := namedChildren(bt.RootNode())
+	nodes := tree.Root().NamedChildren(nil)
 	if len(nodes) != len(keep) {
-		bt.Release()
+		tree.Release()
 		return nil, nil, false
 	}
 	for i, n := range nodes {
 		if int(n.StartByte()) != keep[i].lo || int(n.EndByte()) != keep[i].hi {
-			bt.Release()
+			tree.Release()
 			return nil, nil, false
 		}
 	}
-	return bt, nodes, true
+	return tree, nodes, true
 }
 
 // hints says which of gotreesitter's Go tree repairs run on a source.

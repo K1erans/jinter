@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	gotreesitter "github.com/odvcencio/gotreesitter"
+	"github.com/K1erans/jinter/parse"
 )
 
 type Chunk struct {
@@ -29,6 +29,13 @@ type Options struct {
 	// speed limit: whether a parse beats the clock depends on how busy the
 	// machine is, so a file near it could split differently each search.
 	ParseTimeout time.Duration
+
+	// Parsers routes languages to parser backends, in parse.NewRouter's
+	// format, e.g. "typescript=c,tsx=c". Empty uses parse.Default(),
+	// which the JINTER_PARSER environment variable sets, and which is
+	// gotreesitter for everything when that is unset. Different backends
+	// can split a file differently.
+	Parsers string
 }
 
 // Default gives most functions a chunk of their own, so results point at
@@ -152,12 +159,12 @@ func (s splitter) treePieces(filename string, src []byte, goParser bool) ([]piec
 		cands, via = s.goCandidates(filename, src)
 	}
 	if via == routePlain {
-		bt, ok := parse(filename, src, s.opts.ParseTimeout)
+		tree, ok := s.opts.parseFile(filename, src)
 		if !ok {
 			return nil, routePlain
 		}
-		defer bt.Release()
-		cands, via = s.candidates(bt, bt.RootNode(), ""), routeTree
+		defer tree.Release()
+		cands, via = s.candidates(tree.Root(), ""), routeTree
 	}
 	cands = attachComments(cands)
 
@@ -180,10 +187,10 @@ func (s splitter) treePieces(filename string, src []byte, goParser bool) ([]piec
 }
 
 // candidates lists where pieces may start inside node.
-func (s splitter) candidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node, enclosing string) []candidate {
+func (s splitter) candidates(node parse.Node, enclosing string) []candidate {
 	var out []candidate
-	for _, c := range namedChildren(node) {
-		out = append(out, s.nodeCandidates(bt, c, enclosing)...)
+	for _, c := range node.NamedChildren(nil) {
+		out = append(out, s.nodeCandidates(c, enclosing)...)
 	}
 	return firstPerRow(out)
 }
@@ -191,18 +198,18 @@ func (s splitter) candidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node
 // nodeCandidates lists where pieces may start in node. A node too big to be
 // one piece is opened up, and its header row joins its first inner piece so
 // a method's signature stays with its first lines.
-func (s splitter) nodeCandidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node, enclosing string) []candidate {
-	typ := bt.NodeType(node)
+func (s splitter) nodeCandidates(node parse.Node, enclosing string) []candidate {
+	typ := node.Type()
 	start, end := int(node.StartPoint().Row), int(node.EndPoint().Row)
 	if end >= len(s.lines) {
 		end = len(s.lines) - 1
 	}
 	c := s.leaf(typ, start, end, enclosing)
-	if s.tooBig(start, end) && slices.ContainsFunc(node.Children(), (*gotreesitter.Node).IsNamed) {
+	if s.tooBig(start, end) && hasNamedChild(node) {
 		// Non-definitions on the header row (names, parameters) are part
 		// of the header, which joins the first body candidate.
 		var body []candidate
-		for _, ic := range s.candidates(bt, node, c.sig) {
+		for _, ic := range s.candidates(node, c.sig) {
 			if ic.row > start || ic.rank == rankDef {
 				body = append(body, ic)
 			}
@@ -230,19 +237,6 @@ func (s splitter) leaf(typ string, start, end int, enclosing string) candidate {
 		c.rank = rankOther
 	}
 	return c
-}
-
-// namedChildren lists node's named children. NamedChild(i) and
-// NamedChildCount count from the first child on every call, so looping over
-// them is quadratic: a 3 MB file holding one long literal took 7 minutes.
-func namedChildren(node *gotreesitter.Node) []*gotreesitter.Node {
-	var out []*gotreesitter.Node
-	for _, c := range node.Children() {
-		if c.IsNamed() {
-			out = append(out, c)
-		}
-	}
-	return out
 }
 
 // firstPerRow keeps the first candidate on each row, e.g. a function rather
