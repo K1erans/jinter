@@ -3,8 +3,10 @@ package cache
 
 import (
 	"crypto/sha256"
+	"encoding"
 	"encoding/binary"
 	"hash"
+	"runtime"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -31,10 +33,68 @@ type Cache interface {
 	PutChunks(layouts map[Key][]byte) error
 }
 
+// DirectGetter is an optional fast path implemented by caches that can
+// populate caller-owned slices directly, avoiding allocating and probing a
+// large map when looking up tens of thousands of keys.
+type DirectGetter interface {
+	GetInto(keys []Key, vals []float64, found []bool) error
+}
+
 // Answer is Jev's probability for the chunk and question its key hashes.
 type Answer struct {
 	Key  Key
 	Noul float64
+}
+
+// Keyer computes answer keys for a fixed model and question, pre-normalizing
+// and pre-hashing the (model, question) prefix once so repeated lookups across
+// many chunks avoid redundant normalization and SHA-256 block compressions.
+type Keyer struct {
+	midState [108]byte // marshaled sha256 state after hashing model + normalized question
+	midLen   int
+}
+
+// NewKeyer prepares a Keyer for model and question. It produces the exact same
+// keys as KeyOf(model, question, state).
+func NewKeyer(model, question string) Keyer {
+	s := hashers.Get().(*hasher)
+	defer hashers.Put(s)
+	s.h.Reset()
+	b := binary.LittleEndian.AppendUint64(s.buf[:0], uint64(len(model)))
+	b = append(b, model...)
+	n := len(b)
+	b = appendNormalized(binary.LittleEndian.AppendUint64(b, 0), question)
+	binary.LittleEndian.PutUint64(b[n:], uint64(len(b)-n-8))
+	s.h.Write(b)
+	s.buf = b
+	var k Keyer
+	if app, ok := s.h.(encoding.BinaryAppender); ok {
+		out, err := app.AppendBinary(k.midState[:0])
+		if err != nil {
+			panic(err)
+		}
+		k.midLen = len(out)
+		return k
+	}
+	state, err := s.h.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	k.midLen = copy(k.midState[:], state)
+	return k
+}
+
+// Hash computes the cache key for state using a caller-owned sha256 hash.Hash
+// and a scratch slice (cap >= 32) so workers can hash with zero allocations.
+func (k *Keyer) Hash(h hash.Hash, scratch, state []byte) Key {
+	if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(k.midState[:k.midLen]); err != nil {
+		panic(err)
+	}
+	b := binary.LittleEndian.AppendUint64(scratch[:0], uint64(len(state)))
+	h.Write(b)
+	h.Write(state)
+	b = h.Sum(b[:0])
+	return Key(b)
 }
 
 // KeyOf hashes exactly what Jev is asked about one chunk, as if it were
@@ -54,9 +114,10 @@ func KeyOf(model, question string, state []byte) Key {
 	n := len(b) // the question's length prefix, filled in once it is known
 	b = appendNormalized(binary.LittleEndian.AppendUint64(b, 0), question)
 	binary.LittleEndian.PutUint64(b[n:], uint64(len(b)-n-8))
+	b = binary.LittleEndian.AppendUint64(b, uint64(len(state)))
 	s.h.Write(b)
+	s.h.Write(state)
 	s.buf = b
-	s.part(state)
 	return s.sum()
 }
 
@@ -125,7 +186,7 @@ func appendNormalized(dst []byte, q string) []byte {
 
 // Memory is an in-process Cache, for tests and runs that keep nothing.
 type Memory struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	m      map[Key]float64
 	chunks map[Key][]byte
 }
@@ -133,15 +194,65 @@ type Memory struct {
 func NewMemory() *Memory { return &Memory{m: map[Key]float64{}, chunks: map[Key][]byte{}} }
 
 func (c *Memory) Get(keys []Key) (map[Key]float64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := map[Key]float64{}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[Key]float64, min(len(keys), len(c.m)))
 	for _, k := range keys {
 		if v, ok := c.m[k]; ok {
 			out[k] = v
 		}
 	}
 	return out, nil
+}
+
+// GetInto fills vals[i] and found[i] for each key in keys without allocating a map.
+func (c *Memory) GetInto(keys []Key, vals []float64, found []bool) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	m := c.m
+	n := len(keys)
+	if len(m) == 0 || n == 0 {
+		return nil
+	}
+	const parallelThreshold = 4096
+	if n < parallelThreshold {
+		for i, k := range keys {
+			if v, ok := m[k]; ok {
+				vals[i] = v
+				found[i] = true
+			}
+		}
+		return nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), n/2048)
+	if workers <= 1 {
+		for i, k := range keys {
+			if v, ok := m[k]; ok {
+				vals[i] = v
+				found[i] = true
+			}
+		}
+		return nil
+	}
+	var wg sync.WaitGroup
+	chunk := (n + workers - 1) / workers
+	for w := range workers {
+		lo := w * chunk
+		hi := min(lo+chunk, n)
+		if lo >= hi {
+			break
+		}
+		wg.Go(func() {
+			for i := lo; i < hi; i++ {
+				if v, ok := m[keys[i]]; ok {
+					vals[i] = v
+					found[i] = true
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return nil
 }
 
 func (c *Memory) PutAnswers(answers []Answer) error {
@@ -156,9 +267,9 @@ func (c *Memory) PutAnswers(answers []Answer) error {
 }
 
 func (c *Memory) GetChunks(keys []Key) (map[Key][]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := map[Key][]byte{}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[Key][]byte, min(len(keys), len(c.chunks)))
 	for _, k := range keys {
 		if v, ok := c.chunks[k]; ok {
 			out[k] = v

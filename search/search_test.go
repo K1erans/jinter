@@ -307,25 +307,26 @@ func TestStateEncodingMatchesMarshal(t *testing.T) {
 	// Cache keys hash this encoding, so it must never drift from
 	// json.Marshal, including its escaping of HTML, U+2028 and bad UTF-8.
 	s := new(stateEncoder)
-	s.enc = json.NewEncoder(&s.buf)
-	for _, code := range []string{
-		"if a < b && c > d { return \"x\" }\n\ttab",
-		"line sep para",
-		"bad \xff utf-8",
-		"",
-		"short",
-	} {
-		ch := Chunk{Rel: "app/<x>.go", Chunk: chunk.Chunk{Code: code}}
-		want, err := json.Marshal(jev.State{Path: ch.Rel, Code: code})
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := s.encode(ch)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("encode(%q) = %s, want %s", code, got, want)
+	for _, rel := range []string{"app/<x>.go", "app/<x>.go", "other/path.ts"} {
+		for _, code := range []string{
+			"if a < b && c > d { return \"x\" }\n\ttab",
+			"line sep para",
+			"bad \xff utf-8",
+			"",
+			"short",
+		} {
+			ch := Chunk{Rel: rel, Chunk: chunk.Chunk{Code: code}}
+			want, err := json.Marshal(jev.State{Path: ch.Rel, Code: code})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.encode(ch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("encode(%q, %q) = %s, want %s", rel, code, got, want)
+			}
 		}
 	}
 }

@@ -5,27 +5,44 @@ import (
 	"strings"
 )
 
-// testDirs hold tests, mocks, fixtures or test data in common layouts.
-// Matched case-insensitively, so Swift's Tests/ counts too. RSpec's spec/
-// is left out because API specs live in folders of that name; RSpec files
-// are caught by their _spec.rb names instead.
-var testDirs = map[string]bool{
-	"test": true, "tests": true, "__tests__": true, "__mocks__": true,
-	"testdata": true, "fixtures": true, "__fixtures__": true, "__snapshots__": true,
-}
-
 // IsTest reports whether a slash path looks like a test file or test data.
 // Agents searching for behaviour almost always want the implementation;
 // tests describe the same behaviour and crowd it out of the results.
 func IsTest(rel string) bool {
-	dir, name := path.Split(rel)
-	for part := range strings.SplitSeq(strings.Trim(dir, "/"), "/") {
-		part = strings.ToLower(part)
-		if testDirs[part] || strings.HasSuffix(part, ".tests") {
+	dir, name := splitSlash(rel)
+	for s := strings.Trim(dir, "/"); s != ""; {
+		part := s
+		if i := strings.IndexByte(s, '/'); i >= 0 {
+			part, s = s[:i], s[i+1:]
+		} else {
+			s = ""
+		}
+		if isTestDir(part) {
 			return true
 		}
 	}
 	return testName(name)
+}
+
+func isTestDir(part string) bool {
+	if asciiHasSuffixFold(part, ".tests") {
+		return true
+	}
+	switch len(part) {
+	case 4:
+		return asciiEqualFold(part, "test")
+	case 5:
+		return asciiEqualFold(part, "tests")
+	case 8:
+		return asciiEqualFold(part, "testdata") || asciiEqualFold(part, "fixtures")
+	case 9:
+		return asciiEqualFold(part, "__tests__") || asciiEqualFold(part, "__mocks__")
+	case 12:
+		return asciiEqualFold(part, "__fixtures__")
+	case 13:
+		return asciiEqualFold(part, "__snapshots__")
+	}
+	return false
 }
 
 // testName reports whether a file name follows the test naming convention
@@ -53,7 +70,7 @@ func testName(name string) bool {
 			return true
 		}
 	case ".java", ".kt", ".scala", ".cs", ".php", ".swift":
-		for _, suffix := range []string{"Test", "Tests", "IT", "Spec"} {
+		for _, suffix := range [...]string{"Test", "Tests", "IT", "Spec"} {
 			// The class name before the suffix ends in a lowercase letter
 			// or digit, so Test.java and APITest.java don't count.
 			if before, ok := strings.CutSuffix(stem, suffix); ok && before != "" && isLowerOrDigit(before[len(before)-1]) {

@@ -337,12 +337,55 @@ func TestPutAnswersSavesACallInOneGo(t *testing.T) {
 		}
 	}
 	for k, want := range map[Key]time.Duration{key(1): 0, key(2): time.Hour, key(3): time.Hour} {
-		var used int64
-		if err := c.db.QueryRow(`SELECT last_used FROM answers WHERE key = ?`, k[:]).Scan(&used); err != nil {
+		used, err := c.queryLastUsed(k)
+		if err != nil {
 			t.Fatal(err)
 		}
 		if used != t0.Add(want).Unix() {
 			t.Errorf("last_used is %v, want %v", time.Unix(used, 0).Sub(t0), want)
+		}
+	}
+}
+
+func TestGetIntoMatchesGet(t *testing.T) {
+	c := open(t, filepath.Join(t.TempDir(), "repo.db"), "m")
+	defer c.Close()
+	mem := NewMemory()
+	var batch []Answer
+	for i := range 600 {
+		if i%2 == 0 {
+			batch = append(batch, Answer{Key: key(i), Noul: float64(i) / 600})
+		}
+	}
+	if err := c.PutAnswers(batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.PutAnswers(batch); err != nil {
+		t.Fatal(err)
+	}
+	// Include duplicates and misses in unsorted order.
+	var keys []Key
+	for i := 599; i >= 0; i-- {
+		keys = append(keys, key(i))
+		if i%7 == 0 {
+			keys = append(keys, key(i))
+		}
+	}
+	for _, store := range []DirectGetter{c, mem} {
+		vals := make([]float64, len(keys))
+		found := make([]bool, len(keys))
+		if err := store.GetInto(keys, vals, found); err != nil {
+			t.Fatalf("%T: %v", store, err)
+		}
+		want, err := store.(Cache).Get(keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, k := range keys {
+			v, ok := want[k]
+			if found[i] != ok || (ok && vals[i] != v) {
+				t.Fatalf("%T idx %d: got (%v, %v), want (%v, %v)", store, i, vals[i], found[i], v, ok)
+			}
 		}
 	}
 }

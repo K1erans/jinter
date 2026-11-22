@@ -37,8 +37,9 @@ import (
 //     overflow, and hold a chunk too big to share a call; equal codes in
 //     one file make two chunks share a cache key,
 //   - every subset of the cache keys answered beforehand,
-//   - ReadCache on and off, 1 and 3 workers, and 1 worker with Likely
-//     putting the calls that hold a chunk of the second or fourth code first,
+//   - ReadCache on (via both Cache.Get and DirectGetter.GetInto) and off,
+//     1 and 3 workers, and 1 worker with Likely putting the calls that hold a
+//     chunk of the second or fourth code first,
 //   - Jev answering everything, or failing every call that carries one
 //     chosen chunk.
 //
@@ -101,6 +102,7 @@ type exCase struct {
 	questions int
 	cached    uint // bit i: the i-th distinct cache key was answered beforehand
 	readCache bool
+	directGet bool // store implements cache.DirectGetter (only when readCache is true)
 	workers   int
 	likely    bool // Likely is set, and picks exLikely's codes
 	fail      int  // Jev fails every call carrying this chunk; -1 for none
@@ -114,7 +116,11 @@ type exPair struct{ file, code, question int }
 
 func (c exCase) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d question(s), ReadCache=%v, Workers=%d", c.questions, c.readCache, c.workers)
+	fmt.Fprintf(&b, "%d question(s), ReadCache=%v", c.questions, c.readCache)
+	if c.readCache && c.directGet {
+		b.WriteString(" (DirectGetter)")
+	}
+	fmt.Fprintf(&b, ", Workers=%d", c.workers)
 	if c.likely {
 		fmt.Fprintf(&b, ", Likely picks %q and %q", exCodeNames[1], exCodeNames[3])
 	}
@@ -170,6 +176,22 @@ func (s *exStore) PutAnswers(answers []cache.Answer) error {
 
 func (*exStore) GetChunks([]cache.Key) (map[cache.Key][]byte, error) { return nil, nil }
 func (*exStore) PutChunks(map[cache.Key][]byte) error                { return nil }
+
+// exDirectStore wraps exStore and implements cache.DirectGetter so the
+// exhaustive check exercises Run's GetInto fast path as well as Cache.Get.
+type exDirectStore struct{ *exStore }
+
+func (s *exDirectStore) GetInto(keys []cache.Key, vals []float64, found []bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, k := range keys {
+		if v, ok := s.m[k]; ok {
+			vals[i] = v
+			found[i] = true
+		}
+	}
+	return nil
+}
 
 // exJev answers from exAnswer, knowing only what a real Jev would: the
 // call's path, each chunk's code and its questions.
@@ -299,7 +321,11 @@ func (c exCase) check() (problems []string) {
 	if c.likely {
 		opts.Likely = exLikely
 	}
-	results, err := Run(context.Background(), chunks, client, store, opts)
+	var runStore cache.Cache = store
+	if c.directGet {
+		runStore = &exDirectStore{store}
+	}
+	results, err := Run(context.Background(), chunks, client, runStore, opts)
 	say := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 	problems = append(problems, client.problems...)
 	problems = append(problems, strays...)
@@ -464,7 +490,10 @@ func TestEveryAnswerLandsOnItsOwnChunk(t *testing.T) {
 					}
 				}
 				for c.cached = 0; c.cached < 1<<len(distinct); c.cached++ {
-					for _, c.readCache = range []bool{true, false} {
+					for _, cacheMode := range []struct {
+						read, direct bool
+					}{{true, false}, {true, true}, {false, false}} {
+						c.readCache, c.directGet = cacheMode.read, cacheMode.direct
 						for _, run := range []struct {
 							workers int
 							likely  bool

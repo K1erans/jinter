@@ -39,21 +39,14 @@ func filled(b *testing.B, n int) (*SQLite, []Key) {
 	}
 	b.Cleanup(func() { c.Close() })
 	keys := make([]Key, n)
+	answers := make([]Answer, n)
 	layouts := make(map[Key][]byte, n)
 	for i := range keys {
 		keys[i] = key(i)
+		answers[i] = Answer{Key: keys[i], Noul: float64(i) / float64(n)}
 		layouts[keys[i]] = []byte(strings.Repeat("x", 200))
 	}
-	tx, err := c.db.Begin()
-	if err != nil {
-		b.Fatal(err)
-	}
-	for i, k := range keys {
-		if _, err := tx.Exec(`INSERT INTO answers (key, noul, model, last_used) VALUES (?, ?, 'm', ?)`, k[:], float64(i)/float64(n), now().Unix()); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
+	if err := c.PutAnswers(answers); err != nil {
 		b.Fatal(err)
 	}
 	if err := c.PutChunks(layouts); err != nil {
@@ -153,20 +146,16 @@ func BenchmarkPutAnswers(b *testing.B) {
 	// for the keys call makes.
 	prefilled := func(b *testing.B, rows int) *SQLite {
 		c, _ := filled(b, 0)
-		tx, err := c.db.Begin()
-		if err != nil {
-			b.Fatal(err)
-		}
-		for i := range rows {
-			k := spreadKey(1<<40 + uint64(i))
-			if _, err := tx.Exec(`INSERT INTO answers (key, noul, model, last_used) VALUES (?, 0.5, 'm', ?)`, k[:], now().Unix()); err != nil {
+		if rows > 0 {
+			answers := make([]Answer, rows)
+			for i := range rows {
+				answers[i] = Answer{Key: spreadKey(1<<40 + uint64(i)), Noul: 0.5}
+			}
+			if err := c.PutAnswers(answers); err != nil {
 				b.Fatal(err)
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			b.Fatal(err)
-		}
-		if _, err := c.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		if err := c.execSQL(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			b.Fatal(err)
 		}
 		return c

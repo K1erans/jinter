@@ -189,15 +189,54 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 	if maxSize < 0 {
 		maxSize = 0
 	}
+	var cbMu sync.Mutex
 	onCacheError := func(err error) {
 		if q.OnCacheError != nil {
+			cbMu.Lock()
 			q.OnCacheError(err)
+			cbMu.Unlock()
 		}
+	}
+	var onMatch func(string, search.Match)
+	if q.OnMatch != nil {
+		onMatch = func(question string, m search.Match) {
+			cbMu.Lock()
+			q.OnMatch(question, m)
+			cbMu.Unlock()
+		}
+	}
+
+	open := e.OpenCache
+	if open == nil {
+		open = DiskCache
+	}
+	// Resolve the repository path up front (pure-Go .git lookup) and open the
+	// cache concurrently with walk.Walk so SQLite open/init overlaps with file
+	// discovery and reading.
+	type openResult struct {
+		store cache.Cache
+		close func() error
+		err   error
+	}
+	var openCh chan openResult
+	var preRepo string
+	if r, rerr := walk.Repo(paths[0]); rerr == nil {
+		preRepo = r
+		openCh = make(chan openResult, 1)
+		go func() {
+			s, cl, oerr := open(r, model)
+			openCh <- openResult{store: s, close: cl, err: oerr}
+		}()
 	}
 
 	tests := q.Tests || AboutTests(q.Questions)
 	files, err := walk.Walk(paths, walk.Options{NoIgnore: q.NoIgnore, Tests: tests, Docs: q.Docs, MaxFileSize: maxSize})
 	if err != nil {
+		if openCh != nil {
+			if res := <-openCh; res.err == nil && res.close != nil {
+				_ = res.close()
+			}
+		}
 		return Report{}, err
 	}
 	rep := Report{
@@ -214,24 +253,59 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		q.OnFiles(rep)
 	}
 
-	open := e.OpenCache
-	if open == nil {
-		open = DiskCache
+	var store cache.Cache
+	var closeStore func() error
+	if openCh != nil {
+		res := <-openCh
+		if preRepo == files.Repo {
+			store, closeStore, err = res.store, res.close, res.err
+		} else {
+			if res.err == nil && res.close != nil {
+				_ = res.close()
+			}
+			store, closeStore, err = open(files.Repo, model)
+		}
+	} else {
+		store, closeStore, err = open(files.Repo, model)
 	}
-	store, closeStore, err := open(files.Repo, model)
 	if err != nil {
 		onCacheError(fmt.Errorf("cache unavailable, answers won't be saved: %w", err))
 		store, closeStore = cache.NewMemory(), func() error { return nil }
 	}
+	// Defer saving freshly computed chunk layouts until after Run starts
+	// asking Jev (overlapping SQLite disk writes with network RTT), and always
+	// flush before closing the store.
+	var pendingChunks map[cache.Key][]byte
+	var chunkSaveWG sync.WaitGroup
+	var chunkSaveOnce sync.Once
+	startChunkSave := func() {
+		chunkSaveOnce.Do(func() {
+			if len(pendingChunks) == 0 {
+				return
+			}
+			layouts := pendingChunks
+			pendingChunks = nil
+			chunkSaveWG.Go(func() {
+				if err := store.PutChunks(layouts); err != nil {
+					onCacheError(fmt.Errorf("saving chunk cache: %w", err))
+				}
+			})
+		})
+	}
 	defer func() {
+		startChunkSave()
+		chunkSaveWG.Wait()
 		if err := closeStore(); err != nil {
 			onCacheError(fmt.Errorf("closing cache: %w", err))
 		}
 	}()
 
+	loadStore := deferredChunkStore{Cache: store, onPut: func(layouts map[cache.Key][]byte) {
+		pendingChunks = layouts
+	}}
 	chunks, err := search.LoadContext(ctx, files.Files, search.LoadOptions{
 		Chunk:        chunk.Default,
-		Store:        store,
+		Store:        loadStore,
 		ReadCache:    !q.NoCache,
 		OnCacheError: onCacheError,
 	})
@@ -274,6 +348,13 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 			likely = f.Keep
 		}
 	}
+	onAsk := func(n int) {
+		// Start saving chunk layouts in the background right as Jev calls begin.
+		startChunkSave()
+		if q.OnAsk != nil {
+			q.OnAsk(n)
+		}
+	}
 	rep.Results, err = search.Run(ctx, chunks, client, store, search.Options{
 		Questions:    q.Questions,
 		Model:        model,
@@ -281,8 +362,8 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		Top:          q.Top,
 		ReadCache:    !q.NoCache,
 		OnCacheError: onCacheError,
-		OnAsk:        q.OnAsk,
-		OnMatch:      q.OnMatch,
+		OnAsk:        onAsk,
+		OnMatch:      onMatch,
 		Likely:       likely,
 	})
 	return rep, err
@@ -316,6 +397,18 @@ func prepass(ctx context.Context, chunks []search.Chunk, f *prefilter.Filter) ([
 		}
 	}
 	return kept, nil
+}
+
+// deferredChunkStore intercepts PutChunks during LoadContext so Engine.Search
+// can overlap saving new chunk layouts with Jev network calls.
+type deferredChunkStore struct {
+	cache.Cache
+	onPut func(map[cache.Key][]byte)
+}
+
+func (s deferredChunkStore) PutChunks(layouts map[cache.Key][]byte) error {
+	s.onPut(layouts)
+	return nil
 }
 
 // noClient stands in when Engine.Client is nil, so searches answered

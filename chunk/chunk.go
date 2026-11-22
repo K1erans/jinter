@@ -3,6 +3,7 @@
 package chunk
 
 import (
+	"bytes"
 	"slices"
 	"strconv"
 	"strings"
@@ -77,8 +78,8 @@ func (p piece) segment() bool { return p.hi > 0 }
 
 // Split cuts src into chunks. filename picks the tree-sitter grammar; files
 // without one, or that fail to parse, use a plain indentation splitter. Go
-// files are read with go/parser instead, which finds the same pieces many
-// times faster (see goCandidates).
+// files are read with a fast Go scanner/parser instead, which finds the same
+// pieces many times faster (see goCandidates).
 func Split(filename string, src []byte, opts Options) []Chunk {
 	chunks, _ := split(filename, src, opts, true)
 	return chunks
@@ -90,37 +91,88 @@ type route int
 const (
 	routePlain  route = iota // the plain splitter
 	routeTree                // tree-sitter, over the whole file
-	routeGo                  // go/parser alone
-	routeGoTree              // go/parser, and tree-sitter to open up big declarations
+	routeGo                  // go fast path alone
+	routeGoTree              // go fast path, and tree-sitter to open up big declarations
 )
 
 // split is Split. With goParser false it parses Go files with tree-sitter
 // like any other, which tests compare against.
 func split(filename string, src []byte, opts Options, goParser bool) ([]Chunk, route) {
-	text := string(src)
-	lines := strings.Split(text, "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	if len(lines) == 0 {
+	if len(src) == 0 {
 		return nil, routePlain
 	}
-	s := splitter{text: text, lines: lines, starts: make([]int, len(lines)), opts: opts}
-	for r := 1; r < len(lines); r++ {
-		s.starts[r] = s.starts[r-1] + len(lines[r-1]) + 1
+	text := string(src)
+	starts := lineStarts(src)
+	nLines := len(starts) - 1
+	if nLines == 0 {
+		return nil, routePlain
 	}
+	s := splitter{text: text, starts: starts, nLines: nLines, opts: opts}
 	pieces, via := s.treePieces(filename, src, goParser)
 	if via == routePlain {
 		pieces = s.fallbackPieces()
 	}
-	return s.emit(s.merge(s.limit(pieces))), via
+	limited := s.limit(pieces)
+	return s.emit(limited, s.merge(limited)), via
+}
+
+// lineStarts returns the byte offset of every line in src plus a sentinel at
+// the end so line r is src[starts[r] : starts[r+1]-1]. A trailing newline does
+// not start an extra empty line, matching strings.Split + dropping trailing "".
+func lineStarts(src []byte) []int {
+	if len(src) == 0 {
+		return nil
+	}
+	// Estimate line count to avoid reallocations.
+	est := len(src)/32 + 2
+	starts := make([]int, 1, est)
+	starts[0] = 0
+	pos := 0
+	for {
+		idx := bytes.IndexByte(src[pos:], '\n')
+		if idx < 0 {
+			starts = append(starts, len(src)+1)
+			break
+		}
+		next := pos + idx + 1
+		if next == len(src) {
+			// Trailing newline: line r ends at len(src)-1, sentinel is len(src).
+			starts = append(starts, len(src))
+			break
+		}
+		starts = append(starts, next)
+		pos = next
+	}
+	return starts
 }
 
 type splitter struct {
 	text   string
-	lines  []string // of text
-	starts []int    // byte offset of each line in the source
+	lines  []string // optional: only populated by direct unit tests constructing splitter{lines: ...}
+	starts []int    // byte offset of each line in the source, plus sentinel at index nLines
+	nLines int
 	opts   Options
+}
+
+func (s splitter) numLines() int {
+	if s.lines != nil {
+		return len(s.lines)
+	}
+	return s.nLines
+}
+
+func (s splitter) line(r int) string {
+	if s.lines != nil {
+		return s.lines[r]
+	}
+	return s.text[s.starts[r] : s.starts[r+1]-1]
+}
+
+func (s splitter) lineLen(r int) int {
+	if s.lines != nil {
+		return len(s.lines[r])
+	}
+	return s.starts[r+1] - 1 - s.starts[r]
 }
 
 // rowBytes is the length of rows start..end joined by newlines.
@@ -128,7 +180,10 @@ func (s splitter) rowBytes(start, end int) int {
 	if end < start {
 		return 0
 	}
-	return s.starts[end] + len(s.lines[end]) - s.starts[start]
+	if s.lines != nil {
+		return s.starts[end] + len(s.lines[end]) - s.starts[start]
+	}
+	return s.starts[end+1] - 1 - s.starts[start]
 }
 
 func (s splitter) tooBig(start, end int) bool {
@@ -161,13 +216,14 @@ func (s splitter) treePieces(filename string, src []byte, goParser bool) ([]piec
 	}
 	cands = attachComments(cands)
 
-	var pieces []piece
+	nLines := s.numLines()
+	pieces := make([]piece, 0, len(cands))
 	for i, c := range cands {
 		start := c.row
 		if i == 0 {
 			start = 0
 		}
-		end := len(s.lines) - 1
+		end := nLines - 1
 		if i+1 < len(cands) {
 			end = cands[i+1].row - 1
 		}
@@ -194,8 +250,8 @@ func (s splitter) candidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node
 func (s splitter) nodeCandidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node, enclosing string) []candidate {
 	typ := bt.NodeType(node)
 	start, end := int(node.StartPoint().Row), int(node.EndPoint().Row)
-	if end >= len(s.lines) {
-		end = len(s.lines) - 1
+	if nLines := s.numLines(); end >= nLines {
+		end = nLines - 1
 	}
 	c := s.leaf(typ, start, end, enclosing)
 	if s.tooBig(start, end) && slices.ContainsFunc(node.Children(), (*gotreesitter.Node).IsNamed) {
@@ -292,6 +348,18 @@ var (
 )
 
 func kind(typ string, nested bool) rank {
+	// Fast path for the exact Go node types emitted by goNodes.
+	switch typ {
+	case "function_declaration", "method_declaration":
+		return rankDef
+	case "comment", "import_declaration", "package_clause":
+		return rankSkip
+	case "const_declaration", "type_declaration", "var_declaration":
+		if !nested {
+			return rankDef
+		}
+		return rankOther
+	}
 	if containsAny(typ, skipWords) {
 		return rankSkip
 	}
@@ -318,21 +386,37 @@ func containsAny(s string, words []string) bool {
 func (s splitter) fallbackPieces() []piece {
 	var pieces []piece
 	start := 0
-	for r := 1; r < len(s.lines); r++ {
-		line := s.lines[r]
-		if strings.TrimSpace(line) == "" || indented(line) || closer(line) {
+	nLines := s.numLines()
+	for r := 1; r < nLines; r++ {
+		line := s.line(r)
+		if isBlank(line) || indented(line) || closer(line) {
 			continue
 		}
-		if prev := strings.TrimSpace(s.lines[r-1]); prev == "" || (!indented(s.lines[r-1]) && closer(prev)) {
+		prevLine := s.line(r - 1)
+		if prev := strings.TrimSpace(prevLine); prev == "" || (!indented(prevLine) && closer(prev)) {
 			pieces = append(pieces, piece{start: start, end: r - 1, sig: s.signature(start, r-1), rank: rankOther})
 			start = r
 		}
 	}
-	return append(pieces, piece{start: start, end: len(s.lines) - 1, sig: s.signature(start, len(s.lines)-1), rank: rankOther})
+	return append(pieces, piece{start: start, end: nLines - 1, sig: s.signature(start, nLines-1), rank: rankOther})
+}
+
+func isBlank(line string) bool {
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f' {
+			continue
+		}
+		if c < utf8.RuneSelf {
+			return false
+		}
+		return strings.TrimSpace(line[i:]) == ""
+	}
+	return true
 }
 
 func indented(line string) bool {
-	return strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
+	return len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
 }
 
 func closer(line string) bool {
@@ -344,8 +428,9 @@ func closer(line string) bool {
 // decorator, trimmed for display.
 func (s splitter) signature(start, end int) string {
 	first := ""
-	for r := start; r <= end && r < len(s.lines); r++ {
-		t := strings.TrimSpace(s.lines[r])
+	nLines := s.numLines()
+	for r := start; r <= end && r < nLines; r++ {
+		t := strings.TrimSpace(s.line(r))
 		if t == "" {
 			continue
 		}
@@ -373,17 +458,27 @@ func (s splitter) signature(start, end int) string {
 }
 
 func looksLikeComment(t string) bool {
-	for _, p := range []string{"//", "#", "/*", "*", "--", ";", "@", "<!--", `"""`} {
-		if strings.HasPrefix(t, p) {
-			return true
-		}
+	if len(t) == 0 {
+		return false
+	}
+	switch t[0] {
+	case '#', '*', ';', '@':
+		return true
+	case '/':
+		return len(t) >= 2 && (t[1] == '/' || t[1] == '*')
+	case '-':
+		return len(t) >= 2 && t[1] == '-'
+	case '<':
+		return strings.HasPrefix(t, "<!--")
+	case '"':
+		return strings.HasPrefix(t, `"""`)
 	}
 	return false
 }
 
 // limit splits pieces that are still over the line or byte limits.
 func (s splitter) limit(pieces []piece) []piece {
-	var out []piece
+	out := make([]piece, 0, len(pieces))
 	for _, p := range pieces {
 		if !s.tooBig(p.start, p.end) {
 			out = append(out, p)
@@ -391,7 +486,7 @@ func (s splitter) limit(pieces []piece) []piece {
 		}
 		start := p.start
 		for r := p.start; r <= p.end; r++ {
-			if len(s.lines[r]) > s.opts.MaxBytes {
+			if s.lineLen(r) > s.opts.MaxBytes {
 				if r > start {
 					out = append(out, s.sub(p, start, r-1))
 				}
@@ -403,7 +498,7 @@ func (s splitter) limit(pieces []piece) []piece {
 				cut := r - 1
 				// Prefer ending on a blank line in the back half.
 				for b := r - 1; b > start+(r-start)/2; b-- {
-					if strings.TrimSpace(s.lines[b]) == "" {
+					if isBlank(s.line(b)) {
 						cut = b
 						break
 					}
@@ -426,7 +521,7 @@ func (s splitter) sub(p piece, start, end int) piece {
 // segments cuts one over-long line at rune boundaries.
 func (s splitter) segments(p piece, row int) []piece {
 	var out []piece
-	line := s.lines[row]
+	line := s.line(row)
 	for lo := 0; lo < len(line); {
 		hi := min(lo+s.opts.MaxBytes, len(line))
 		for hi < len(line) && hi > lo && !utf8.RuneStart(line[hi]) {
@@ -444,46 +539,60 @@ func (s splitter) segments(p piece, row int) []piece {
 	return out
 }
 
+// pieceGroup is a contiguous slice pieces[lo:hi] merged into one chunk.
+type pieceGroup struct {
+	lo, hi int
+}
+
 // merge joins short neighbouring pieces while the result stays in limits.
 // A run of imports, package lines and comments always joins what follows
 // it: on its own it would cost a Jev request and never match a question.
-func (s splitter) merge(pieces []piece) [][]piece {
-	var groups [][]piece
-	fits := func(g []piece, p piece) bool {
-		return !g[0].segment() && !p.segment() && !s.tooBig(g[0].start, p.end)
+func (s splitter) merge(pieces []piece) []pieceGroup {
+	groups := make([]pieceGroup, 0, len(pieces))
+	fits := func(g pieceGroup, p piece) bool {
+		return !pieces[g.lo].segment() && !p.segment() && !s.tooBig(pieces[g.lo].start, p.end)
 	}
-	short := func(g []piece) bool {
-		return g[len(g)-1].end-g[0].start+1 < s.opts.MinLines || !slices.ContainsFunc(g, func(p piece) bool { return p.rank != rankSkip })
+	short := func(g pieceGroup) bool {
+		if pieces[g.hi-1].end-pieces[g.lo].start+1 < s.opts.MinLines {
+			return true
+		}
+		for i := g.lo; i < g.hi; i++ {
+			if pieces[i].rank != rankSkip {
+				return false
+			}
+		}
+		return true
 	}
-	for _, p := range pieces {
+	for i, p := range pieces {
 		if n := len(groups); n > 0 && short(groups[n-1]) && fits(groups[n-1], p) {
-			groups[n-1] = append(groups[n-1], p)
+			groups[n-1].hi = i + 1
 			continue
 		}
-		groups = append(groups, []piece{p})
+		groups = append(groups, pieceGroup{lo: i, hi: i + 1})
 	}
 	// A short tail joins the group before it.
-	if n := len(groups); n > 1 && short(groups[n-1]) && fits(groups[n-2], groups[n-1][len(groups[n-1])-1]) {
-		groups[n-2] = append(groups[n-2], groups[n-1]...)
+	if n := len(groups); n > 1 && short(groups[n-1]) && fits(groups[n-2], pieces[groups[n-1].hi-1]) {
+		groups[n-2].hi = groups[n-1].hi
 		groups = groups[:n-1]
 	}
 	return groups
 }
 
-func (s splitter) emit(groups [][]piece) []Chunk {
-	var out []Chunk
-	for _, g := range groups {
+func (s splitter) emit(pieces []piece, groups []pieceGroup) []Chunk {
+	out := make([]Chunk, 0, len(groups))
+	for _, gr := range groups {
+		g := pieces[gr.lo:gr.hi]
 		sig := groupSignature(g)
 		if g[0].segment() {
 			p := g[0]
-			out = append(out, Chunk{Start: p.start + 1, End: p.start + 1, Signature: sig, Code: s.lines[p.start][p.lo:p.hi], Offset: s.starts[p.start] + p.lo})
+			out = append(out, Chunk{Start: p.start + 1, End: p.start + 1, Signature: sig, Code: s.line(p.start)[p.lo:p.hi], Offset: s.starts[p.start] + p.lo})
 			continue
 		}
 		start, end := g[0].start, g[len(g)-1].end
-		for start <= end && strings.TrimSpace(s.lines[start]) == "" {
+		for start <= end && isBlank(s.line(start)) {
 			start++
 		}
-		for end >= start && strings.TrimSpace(s.lines[end]) == "" {
+		for end >= start && isBlank(s.line(end)) {
 			end--
 		}
 		if start > end {
@@ -493,7 +602,7 @@ func (s splitter) emit(groups [][]piece) []Chunk {
 			Start:     start + 1,
 			End:       end + 1,
 			Signature: sig,
-			Code:      s.text[s.starts[start] : s.starts[end]+len(s.lines[end])],
+			Code:      s.text[s.starts[start] : s.starts[end]+s.lineLen(end)],
 			Offset:    s.starts[start],
 		})
 	}
@@ -503,6 +612,9 @@ func (s splitter) emit(groups [][]piece) []Chunk {
 // groupSignature names a chunk by its first best-ranked piece and counts the
 // other definitions it holds.
 func groupSignature(g []piece) string {
+	if len(g) == 1 {
+		return g[0].sig
+	}
 	best := 0
 	for i, p := range g {
 		if p.rank > g[best].rank {
@@ -510,15 +622,40 @@ func groupSignature(g []piece) string {
 		}
 	}
 	more := 0
-	seen := map[string]bool{g[best].sig: true}
-	for i, p := range g {
-		if i != best && p.rank == rankDef && !seen[p.sig] {
-			seen[p.sig] = true
-			more++
+	bestSig := g[best].sig
+	if len(g) <= 8 {
+		for i, p := range g {
+			if i == best || p.rank != rankDef || p.sig == bestSig {
+				continue
+			}
+			dup := false
+			for j := 0; j < i; j++ {
+				if j != best && g[j].rank == rankDef && g[j].sig == p.sig {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				more++
+			}
+		}
+	} else {
+		var seen map[string]bool
+		for i, p := range g {
+			if i == best || p.rank != rankDef || p.sig == bestSig {
+				continue
+			}
+			if seen == nil {
+				seen = make(map[string]bool, 8)
+			}
+			if !seen[p.sig] {
+				seen[p.sig] = true
+				more++
+			}
 		}
 	}
 	if more > 0 {
-		return g[best].sig + " +" + strconv.Itoa(more) + " more"
+		return bestSig + " +" + strconv.Itoa(more) + " more"
 	}
-	return g[best].sig
+	return bestSig
 }

@@ -169,9 +169,25 @@ func TestPacksChunksOfOneFileIntoOneRequest(t *testing.T) {
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
+// wireJSON is json.Marshal without HTML escaping, as request bodies are sent.
+func wireJSON(v any) string {
+	var b strings.Builder
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(v); err != nil {
+		panic(err)
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
 // marshalRequest is how the body was built before encodeRequest, and how
-// the token estimate was fitted: json.Marshal of a struct.
-func marshalRequest(req Request) []byte {
+// the token estimate was fitted: json.Marshal of a struct. With html false
+// it skips HTML escaping, as bodies are sent now.
+func marshalRequest(req Request, html bool) []byte {
+	enc := wireJSON
+	if html {
+		enc = mustJSON
+	}
 	type question struct {
 		Type         string `json:"type"`
 		Instructions string `json:"instructions"`
@@ -189,7 +205,7 @@ func marshalRequest(req Request) []byte {
 		if i > 0 {
 			s.WriteByte(',')
 		}
-		s.WriteString(mustJSON(k) + ":" + mustJSON(state[k]))
+		s.WriteString(enc(k) + ":" + enc(state[k]))
 	}
 	s.WriteByte('}')
 	qs := map[string]question{}
@@ -198,19 +214,17 @@ func marshalRequest(req Request) []byte {
 			qs[id(len(qs))] = question{"noul", instruction(field(req, i), q)}
 		}
 	}
-	b, err := json.Marshal(struct {
+	return []byte(enc(struct {
 		Model     string              `json:"model"`
 		State     json.RawMessage     `json:"state"`
 		Questions map[string]question `json:"questions"`
-	}{req.Model, json.RawMessage(s.String()), qs})
-	if err != nil {
-		panic(err)
-	}
-	return b
+	}{req.Model, json.RawMessage(s.String()), qs}))
 }
 
-// The wire format, and the byte count the token estimate rests on, stay
-// exactly as json.Marshal wrote them: HTML escaped, questions in key order.
+// The wire format stays exactly as json.Marshal wrote it, questions in key
+// order, except that '<', '>' and '&' go unescaped: the same strings to the
+// server in fewer bytes. The token estimate still charges the HTML-escaped
+// size it was fitted on.
 func TestRequestBodyIsByteForByteWhatJSONMarshalWrote(t *testing.T) {
 	many := make([]string, 23) // q10 … q22 sort between q1 and q2
 	for i := range many {
@@ -231,8 +245,11 @@ func TestRequestBodyIsByteForByteWhatJSONMarshalWrote(t *testing.T) {
 		}}},
 	} {
 		got, n := encodeRequest(r)
-		if want := marshalRequest(r); string(got) != string(want) {
+		if want := marshalRequest(r, false); string(got) != string(want) {
 			t.Errorf("%s:\n got %s\nwant %s", name, got, want)
+		}
+		if old := marshalRequest(r, true); cost(got) != requestOverheadTokens+int(math.Ceil(float64(len(old))/bytesPerToken)) {
+			t.Errorf("%s: costs %d tokens, the HTML-escaped body %d", name, cost(got), cost(old))
 		}
 		want := 0
 		for _, ch := range r.Chunks {
@@ -695,5 +712,30 @@ func TestANewClientHasItsTokenBurstInHand(t *testing.T) {
 	}
 	if s := clk.sleeps(); len(s) != 0 {
 		t.Fatalf("the first burst waited %v", s)
+	}
+}
+
+// bodyCheck records whether each request could be resent, then passes it on.
+type bodyCheck struct {
+	next http.RoundTripper
+	t    *testing.T
+}
+
+func (b bodyCheck) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.GetBody == nil {
+		b.t.Error("request has no GetBody: the transport can't resend it on a dead keep-alive connection")
+	} else if body, err := r.GetBody(); err != nil {
+		b.t.Error(err)
+	} else if got, _ := io.ReadAll(body); !strings.HasPrefix(string(got), `{"model":`) {
+		b.t.Errorf("GetBody gave %q", got)
+	}
+	return b.next.RoundTrip(r)
+}
+
+func TestRequestsCanBeResentByTheTransport(t *testing.T) {
+	c, _, _ := serve(t, quick, okHandler)
+	c.http.Transport = bodyCheck{c.http.Transport, t}
+	if _, err := c.Ask(context.Background(), req); err != nil {
+		t.Fatal(err)
 	}
 }

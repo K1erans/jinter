@@ -10,6 +10,7 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
 type Filter struct {
@@ -43,13 +44,81 @@ func New(pattern string, questions []string) (*Filter, error) {
 	return &Filter{re: re, words: words}, nil
 }
 
+// upperASCII copies s into dst while uppercasing ASCII 'a'..'z' 8 bytes at a
+// time using branchless SWAR. Returns false immediately if any byte >= 0x80
+// is encountered so the caller falls back to full Unicode case-folding.
+func upperASCII(dst []byte, s string) bool {
+	n := len(s)
+	if n == 0 {
+		return true
+	}
+	srcPtr := unsafe.StringData(s)
+	dstPtr := unsafe.SliceData(dst)
+	i := 0
+	const (
+		hiBits = 0x8080808080808080
+		addA   = 0x1f1f1f1f1f1f1f1f // 0x61 ('a') + 0x1f = 0x80
+		addZ   = 0x0505050505050505 // 0x7b ('z'+1) + 0x05 = 0x80
+	)
+	for ; i+8 <= n; i += 8 {
+		v := *(*uint64)(unsafe.Add(unsafe.Pointer(srcPtr), i))
+		if v&hiBits != 0 {
+			return false
+		}
+		// Bit 7 of each lane is 1 iff 'a' <= b <= 'z'. No lane overflows 0xFF
+		// since v has bit 7 == 0 (max byte 0x7f; 0x7f + 0x1f = 0x9e <= 0xff).
+		isLower := ((v + addA) &^ (v + addZ)) & hiBits
+		*(*uint64)(unsafe.Add(unsafe.Pointer(dstPtr), i)) = v - (isLower >> 2)
+	}
+	for ; i < n; i++ {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			return false
+		}
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		dst[i] = c
+	}
+	return true
+}
+
 // Keep reports whether any keyword appears in code.
 func (f *Filter) Keep(code string) bool {
 	if f.words == nil {
 		return f.re.MatchString(code)
 	}
+	// Fast path: branchless 8-byte SWAR ASCII uppercasing into a stack buffer
+	// (or pooled buffer for >4 KiB chunks), then AVX2 bytes.Contains.
+	var stack [4096]byte
+	var upper []byte
+	if len(code) <= len(stack) {
+		upper = stack[:len(code)]
+		if upperASCII(upper, code) {
+			for _, w := range f.words {
+				if bytes.Contains(upper, w) {
+					return true
+				}
+			}
+			return false
+		}
+	}
 	buf := bufs.Get().(*[]byte)
 	defer bufs.Put(buf)
+	if len(code) > len(stack) {
+		if cap(*buf) < len(code) {
+			*buf = make([]byte, len(code))
+		}
+		upper = (*buf)[:len(code)]
+		if upperASCII(upper, code) {
+			for _, w := range f.words {
+				if bytes.Contains(upper, w) {
+					return true
+				}
+			}
+			return false
+		}
+	}
 	*buf = fold((*buf)[:0], code)
 	for _, w := range f.words {
 		if bytes.Contains(*buf, w) {

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"testing"
 )
@@ -66,5 +67,29 @@ func FuzzKeyOf(f *testing.F) {
 		if KeyOf("m", q, state) != Hash([]byte("m"), []byte(normalize(q)), state) {
 			t.Fatalf("KeyOf(%q) disagrees with Hash", q)
 		}
+		k := NewKeyer("m", q)
+		if k.Hash(sha256.New(), make([]byte, 0, 32), state) != KeyOf("m", q, state) {
+			t.Fatalf("Keyer(%q) disagrees with KeyOf", q)
+		}
 	})
+}
+
+func TestKeyerMatchesKeyOf(t *testing.T) {
+	h := sha256.New()
+	scratch := make([]byte, 0, 32)
+	for _, tc := range []struct {
+		model, q, state string
+	}{
+		{"jev-1.13.0", "  The `code`  Retries\tfailed payments ", `{"path":"src/retry.ts","code":"retry()"}`},
+		{"jev-1.13.0", "The `code` RÉSUMÉ\u00a0parsing İ", "x"},
+		{"m", "", ""},
+		{"jev-1.13.0", "The `code` " + string(make([]byte, 200)), "payload"},
+	} {
+		want := KeyOf(tc.model, tc.q, []byte(tc.state))
+		k := NewKeyer(tc.model, tc.q)
+		got := k.Hash(h, scratch, []byte(tc.state))
+		if got != want {
+			t.Errorf("Keyer(%q, %q) = %x, want %x", tc.model, tc.q, got, want)
+		}
+	}
 }

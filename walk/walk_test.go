@@ -328,6 +328,10 @@ func TestGeneratedFilesAreSkippedUnlessNamed(t *testing.T) {
 		"src/lockfile.go":            "package src\n",
 		"src/admin.js":               "x\n",
 		"src/node_modules_doc.go":    "package src\n",
+		"ext/vendor/three.module.js": "x\n",
+		"bower_components/x/x.js":    "x\n",
+		"src/vendors.go":             "package src\n", // only a folder named vendor
+		"vendoring/v.go":             "package vendoring\n",
 	})
 	t.Chdir(dir)
 
@@ -335,17 +339,21 @@ func TestGeneratedFilesAreSkippedUnlessNamed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"app.js", "src/admin.js", "src/lockfile.go", "src/node_modules_doc.go", "src/sitemap.go"}
+	want := []string{"app.js", "src/admin.js", "src/lockfile.go", "src/node_modules_doc.go", "src/sitemap.go", "src/vendors.go", "vendoring/v.go"}
 	if got := paths(res.Files); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
 	}
-	if res.Generated != 12 || res.Tests != 0 {
-		t.Fatalf("want 12 generated files and no tests counted as skipped, got %d and %d", res.Generated, res.Tests)
+	if res.Generated != 14 || res.Tests != 0 {
+		t.Fatalf("want 14 generated files and no tests counted as skipped, got %d and %d", res.Generated, res.Tests)
 	}
 
 	res, _ = Walk([]string{"package-lock.json", "node_modules/dep"}, Options{Tests: true})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"node_modules/dep/a.js", "node_modules/dep/test/a.js", "package-lock.json"}) {
 		t.Fatalf("generated files named explicitly are searched: %v", got)
+	}
+	res, _ = Walk([]string{"ext/vendor"}, Options{})
+	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"ext/vendor/three.module.js"}) {
+		t.Fatalf("a vendor folder named explicitly is searched: %v", got)
 	}
 }
 

@@ -21,7 +21,7 @@ No verifier runs on this Go code (it uses generics, goroutines and the standard 
 go test ./search -run TestEveryAnswerLandsOnItsOwnChunk -count=1 -v
 ```
 
-About 8 seconds, about 1.1 million searches, no tools beyond the Go toolchain in `go.mod`. It also runs as part of `go test ./...`. Under `-race` it uses bounds one chunk smaller so the race run stays at a few seconds.
+About 9 seconds, about 1.68 million searches, no tools beyond the Go toolchain in `go.mod`. It also runs as part of `go test ./...`. Under `-race` it uses bounds one chunk smaller so the race run stays at a few seconds.
 
 The code is in `search/exhaustive_test.go`; the bounds are in `search/exhaustive_bounds_test.go` and `search/exhaustive_bounds_race_test.go`.
 
@@ -31,7 +31,7 @@ The code is in `search/exhaustive_test.go`; the bounds are in `search/exhaustive
 - the chunks split across files in every way that keeps a file's chunks together;
 - each chunk's code one of four bodies: two small ones, one exactly half of `packBytes`, one bigger than `packBytes`. So packs fill exactly, overflow, and hold a chunk too big to share a call, and two chunks of a file with the same code share one cache key;
 - every subset of the cache keys answered beforehand;
-- `ReadCache` on and off, `Workers` 1 and 3, and 1 worker with `Likely` picking two of the four code bodies;
+- `ReadCache` on (via both `Cache.Get` and `DirectGetter.GetInto`) and off, `Workers` 1 and 3, and 1 worker with `Likely` picking two of the four code bodies;
 - Jev answering everything, or failing every call that carries one chosen chunk.
 
 ### For each search it requires
@@ -59,20 +59,20 @@ The fake Jev in the test knows only what the real one would: the call's path, ea
 
 | Check | Code it describes |
 |---|---|
-| 1, 2 (cache writes) | `search/search.go`: `Run`'s `ask` closure, `keyAll`, `stateEncoder.encode`; `cache/cache.go`: `KeyOf`, `Cache.PutAnswers` |
-| 3 (what Jev is asked) | `search/search.go`: `Run`'s cache-read loop that builds `tasks`, `packs`, `packBytes`, the request built in `ask` |
+| 1, 2 (cache writes) | `search/search.go`: `Run`'s `ask` closure, `keyAll`, `stateEncoder.encode`; `cache/cache.go`: `KeyOf`, `Keyer`, `Cache.PutAnswers` |
+| 3 (what Jev is asked) | `search/search.go`: `Run`'s cache-read loops (`DirectGetter.GetInto` and `Cache.Get`) that build `tasks`, `packs`, `packBytes`, the request built in `ask` |
 | 4 (errors) | `search/search.go`: `parallel`, the error returns in `ask` |
-| 5 (results) | `search/search.go`: `rank`, `topK`, the `scores` layout in `Run` |
-| 6 (`OnMatch`) | `search/search.go`: `Run`'s `heard` closure, its calls in the cache-read loop and in `ask`, `matchOf` |
+| 5 (results) | `search/search.go`: `rank`, `siftDownScored`, `topK`, the `scores` layout in `Run` |
+| 6 (`OnMatch`) | `search/search.go`: `Run`'s `heard` closure, its calls in both cache-read loops and in `ask`, `matchOf` |
 | 7 (`Likely`) | `search/search.go`: `likelyFirst` |
-| Expected keys | `jev/jev.go`: `State`, `Instruction`; `cache/cache.go`: `KeyOf` |
+| Expected keys | `jev/jev.go`: `State`, `Instruction`; `cache/cache.go`: `KeyOf`, `Keyer` |
 
-**Last confirmed in step with the code:** commit `73cd75d` (2026-11-22). The covered files' contents at that commit, from `git hash-object <file>`:
+**Last confirmed in step with the code:** working tree on top of `9b03831` (2026-11-22). The covered files' contents at that point, from `git hash-object <file>`:
 
 | File | Blob |
 |---|---|
-| `search/search.go` | `d2647a471c2c42fd894e7a3b2ddb85683db6fddd` |
-| `cache/cache.go` | `3fa4f624bfb3647300d38aa787335e502939bd86` |
+| `search/search.go` | `3f6a33f2e42729250e0a4d8a2ac6fed97d4c0b38` |
+| `cache/cache.go` | `f2e0955a2886047e710321bd403025c003dcd6e1` |
 | `jev/jev.go` | `876b75fb5ac1ad19950d7c2cd8ebcabfedb77b41` |
 
 If `git hash-object` gives a different value for a file, it changed after the check was last confirmed: read `git diff 73cd75d -- <file>` before trusting a pass, and update the commit and the table together.

@@ -7,13 +7,37 @@ import (
 	"strings"
 )
 
+type ruleKind uint8
+
+const (
+	ruleRegex  ruleKind = iota
+	ruleExact           // exact match: subject == pat
+	ruleSuffix          // "*.ext" (no slash): strings.HasSuffix(subject, pat) && !strings.Contains(subject, "/")
+	rulePrefix          // "foo/**" anchored: subject == pat || strings.HasPrefix(subject, pat+"/")
+)
+
 // rule is one compiled .gitignore line.
 type rule struct {
 	base    string // folder holding the .gitignore
+	kind    ruleKind
+	pat     string
 	re      *regexp.Regexp
 	negate  bool
 	dirOnly bool
 	anchor  bool // matched against the path from base, not just the name
+}
+
+func (r *rule) match(subject string) bool {
+	switch r.kind {
+	case ruleExact:
+		return subject == r.pat
+	case ruleSuffix:
+		return strings.HasSuffix(subject, r.pat)
+	case rulePrefix:
+		return len(subject) > len(r.pat) && subject[len(r.pat)] == '/' && strings.HasPrefix(subject, r.pat)
+	default:
+		return r.re.MatchString(subject)
+	}
 }
 
 // ruleSet is the ordered list of rules in effect in one folder: parent rules
@@ -24,7 +48,7 @@ func (rs *ruleSet) ignored(path string, isDir bool) bool {
 	if rs == nil {
 		return false
 	}
-	name := filepath.Base(path)
+	name := baseName(path)
 	// The last matching rule decides, so search from the end. Rules from
 	// one .gitignore share a base and sit together, so path's rel from a
 	// base is worked out once, not once per anchored rule.
@@ -37,21 +61,50 @@ func (rs *ruleSet) ignored(path string, isDir bool) bool {
 		subject := name
 		if r.anchor {
 			if r.base != base {
-				base, rel = r.base, ""
-				if p, err := filepath.Rel(base, path); err == nil && !escapes(p) {
-					rel = filepath.ToSlash(p)
-				}
+				base, rel = r.base, relUnder(r.base, path)
 			}
 			if rel == "" {
 				continue // path isn't under the rule's folder
 			}
 			subject = rel
 		}
-		if r.re.MatchString(subject) {
+		if r.match(subject) {
 			return !r.negate
 		}
 	}
 	return false
+}
+
+func baseName(p string) string {
+	if i := strings.LastIndexByte(p, filepath.Separator); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+// relUnder returns path's slash path relative to base, or "" if path is not
+// under base. Avoids filepath.Rel on the common clean prefix case.
+func relUnder(base, path string) string {
+	if base == "." {
+		if path == "." || escapes(path) {
+			return ""
+		}
+		if filepath.Separator == '/' {
+			return path
+		}
+		return filepath.ToSlash(path)
+	}
+	if len(path) > len(base) && path[len(base)] == filepath.Separator && path[:len(base)] == base {
+		sub := path[len(base)+1:]
+		if filepath.Separator == '/' {
+			return sub
+		}
+		return filepath.ToSlash(sub)
+	}
+	if p, err := filepath.Rel(base, path); err == nil && !escapes(p) {
+		return filepath.ToSlash(p)
+	}
+	return ""
 }
 
 // with returns the rules for dir: rs plus dir's own .gitignore, if any.
@@ -104,12 +157,33 @@ func parseRule(base, line string) (rule, bool) {
 	if line == "" {
 		return rule{}, false
 	}
+	// Fast non-regex matchers for the common .gitignore shapes.
+	if !hasGlobMeta(line) {
+		r.kind = ruleExact
+		r.pat = line
+		return r, true
+	}
+	if !r.anchor && strings.HasPrefix(line, "*") && !hasGlobMeta(line[1:]) {
+		r.kind = ruleSuffix
+		r.pat = line[1:]
+		return r, true
+	}
+	if r.anchor && strings.HasSuffix(line, "/**") && !hasGlobMeta(line[:len(line)-3]) {
+		r.kind = rulePrefix
+		r.pat = line[:len(line)-3]
+		return r, true
+	}
 	re, err := regexp.Compile("^" + globToRegexp(line) + "$")
 	if err != nil {
 		return rule{}, false
 	}
+	r.kind = ruleRegex
 	r.re = re
 	return r, true
+}
+
+func hasGlobMeta(s string) bool {
+	return strings.ContainsAny(s, `*?[\`)
 }
 
 func globToRegexp(glob string) string {
