@@ -98,7 +98,8 @@ func shapeOf(n Node, src []byte) string {
 }
 
 // tsasm reads the same grammar versions as the C backend, so where a file
-// parses, their trees are the same: types, spans, rows and parents.
+// parses, their trees are the same: types, spans, rows, parents and
+// fields.
 func TestTsasmTreesMatchC(t *testing.T) {
 	c := Lookup("c")
 	if c == nil {
@@ -149,8 +150,8 @@ func TestTsasmTreesMatchC(t *testing.T) {
 			w, g := wn[i], gn[i]
 			if w.Type() != g.Type() || w.IsNamed() != g.IsNamed() || w.StartByte() != g.StartByte() || w.EndByte() != g.EndByte() ||
 				w.StartPoint() != g.StartPoint() || w.EndPoint() != g.EndPoint() || w.Parent().StartByte() != g.Parent().StartByte() ||
-				w.ChildCount() != g.ChildCount() {
-				t.Errorf("%s: node %d is %q %v-%v, C's is %q %v-%v", f, i, g.Type(), g.StartPoint(), g.EndPoint(), w.Type(), w.StartPoint(), w.EndPoint())
+				w.ChildCount() != g.ChildCount() || w.FieldName() != g.FieldName() {
+				t.Errorf("%s: node %d is %s:%q %v-%v, C's is %s:%q %v-%v", f, i, g.FieldName(), g.Type(), g.StartPoint(), g.EndPoint(), w.FieldName(), w.Type(), w.StartPoint(), w.EndPoint())
 				break
 			}
 		}

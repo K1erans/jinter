@@ -33,9 +33,8 @@ var samples = []sample{
 		"function_item", []string{"f", "g"}, "type", "String"},
 }
 
-// fieldless says whether b's trees lack grammar fields and highlight
-// queries, as tsasm's do.
-func fieldless(b Backend) bool { return b.Name() == "tsasm" }
+// noHighlights says whether b lacks highlight queries, as tsasm does.
+func noHighlights(b Backend) bool { return b.Name() == "tsasm" }
 
 // walk calls fn on every node under n, n included, in order.
 func walk(n Node, fn func(Node)) {
@@ -94,7 +93,7 @@ func TestBackendsReturnTheWholeTree(t *testing.T) {
 			if p := n.StartPoint(); offset(s.src, p) != int(n.StartByte()) {
 				t.Fatalf("%q starts at %+v, byte %d", n.Type(), p, n.StartByte())
 			}
-			if n.Type() == s.funcType && !fieldless(b) {
+			if n.Type() == s.funcType {
 				name := n.ChildByField("name")
 				if name.FieldName() != "name" {
 					t.Errorf("%q's name field is %q", tree.Text(name), name.FieldName())
@@ -102,7 +101,7 @@ func TestBackendsReturnTheWholeTree(t *testing.T) {
 				names = append(names, tree.Text(name))
 			}
 		})
-		if !fieldless(b) && !slices.Equal(names, s.funcs) {
+		if !slices.Equal(names, s.funcs) {
 			t.Errorf("functions %v, want %v", names, s.funcs)
 		}
 		if count < 10 {
@@ -150,7 +149,7 @@ func offset(src string, p Point) int {
 
 func TestBackendsRunTheirHighlightQuery(t *testing.T) {
 	eachBackend(t, func(t *testing.T, b Backend, s sample) {
-		if fieldless(b) {
+		if noHighlights(b) {
 			t.Skip("no highlight query")
 		}
 		tree, err := b.Parse(context.Background(), s.lang, []byte(s.src), 0)

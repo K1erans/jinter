@@ -221,9 +221,9 @@ in x86-64 assembly, for Go, C, Java and JSON.
 It reads the same official grammars as the C backend, so where a file
 parses, the trees are the same. It has no error recovery: a file with
 syntax errors gets no tree, and jinter splits it as plain text, as it
-does a tree with errors. Its trees have no grammar fields or highlight
-captures, which chunking doesn't use. Like the C backend it needs cgo and
-a C compiler, which assembles it; then route to it:
+does a tree with errors. It has no highlight captures, which chunking
+doesn't use. Like the C backend it needs cgo and a C compiler, which
+assembles it; then route to it:
 
 ```
 go build -tags jinter_tsasm .

@@ -23,11 +23,10 @@ func init() { backends["tsasm"] = tsasmB }
 // pins for the C backend.
 //
 // It differs from the other backends in three ways. It has no error
-// recovery: a source with syntax errors gives no tree and ErrSyntax. Its
-// trees have no grammar fields, so ChildByField returns the null node and
-// FieldName "", and no highlight query, so Highlights adds nothing. And it
-// ignores the timeout: its own work budget, a fixed number of steps per
-// input byte, stops a runaway parse with ErrStoppedEarly instead.
+// recovery: a source with syntax errors gives no tree and ErrSyntax. It
+// has no highlight query, so Highlights adds nothing. And it ignores the
+// timeout: its own work budget, a fixed number of steps per input byte,
+// stops a runaway parse with ErrStoppedEarly instead.
 var Tsasm Backend = tsasmB
 
 var tsasmB = &tsasmBackend{}
@@ -124,8 +123,21 @@ func (t *tsasmTree) startPoint(n Node) Point { return t.point(t.at(n).Start) }
 func (t *tsasmTree) endPoint(n Node) Point   { return t.point(t.at(n).End) }
 func (t *tsasmTree) id(n Node) uintptr       { return uintptr(tsasmIndex(n)) + 1 }
 
-func (t *tsasmTree) childByField(Node, string) Node { return Node{} }
-func (t *tsasmTree) fieldName(Node) string          { return "" }
+// Each node carries its own field, as C tree-sitter's tree cursor gives
+// it, so the first child in a field is the first child with it.
+func (t *tsasmTree) childByField(n Node, field string) Node {
+	var out Node
+	t.eachChild(n, func(c int32) bool {
+		if f := t.nodes[c].Field; f != 0 && t.lang.FieldName(f) == field {
+			out = t.node(c)
+			return false
+		}
+		return true
+	})
+	return out
+}
+
+func (t *tsasmTree) fieldName(n Node) string { return t.lang.FieldName(t.at(n).Field) }
 
 func (t *tsasmTree) highlights(_ *Tree, dst []Capture) ([]Capture, error) { return dst, nil }
 

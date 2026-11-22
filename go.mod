@@ -3,7 +3,7 @@ module github.com/K1erans/jinter
 go 1.26.5
 
 require (
-	github.com/K1erans/tsasm v0.0.0-20261122161319-ef201d02577e
+	github.com/K1erans/tsasm v0.0.0-20261122162503-fd55315e155c
 	github.com/odvcencio/gotreesitter v0.58.0
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	github.com/tree-sitter/tree-sitter-c v0.24.2
