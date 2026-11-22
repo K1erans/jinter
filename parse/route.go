@@ -21,7 +21,7 @@ const EnvVar = "JINTER_PARSER"
 var backends = map[string]Backend{"gotreesitter": gts}
 
 // Backends lists the backends this build has: gotreesitter always, c with
-// the jinter_cgo build tag.
+// the jinter_cgo build tag, tsasm with the jinter_tsasm tag.
 func Backends() []Backend {
 	var out []Backend
 	for _, name := range slices.Sorted(maps.Keys(backends)) {

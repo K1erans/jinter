@@ -90,7 +90,8 @@ limit them; `rep` still has every match, best first.
    tree-sitter (206 grammars). Go files are read with the standard
    library's `go/parser` instead, which is many times faster and finds the
    same chunks; tree-sitter only opens up declarations too big for one
-   chunk. Files with no grammar, or that fail to parse, are split at
+   chunk (unless Go is routed to tsasm; see [Parser backends](#parser-backends)).
+   Files with no grammar, or that fail to parse, are split at
    unindented lines.
 3. **Narrow**, optionally, with a keyword pre-pass (`Prepass`) or to the
    chunks that best matched an earlier question (`Refine`).
@@ -185,7 +186,7 @@ their own:
 |---|---|
 | [`walk`](walk) | File listing, `.gitignore`, binary, generated, test and doc detection |
 | [`chunk`](chunk) | Splitting files into function-sized chunks |
-| [`parse`](parse) | Syntax trees and highlight captures behind one interface, with the parser chosen per language: gotreesitter by default, C tree-sitter with `-tags jinter_cgo` |
+| [`parse`](parse) | Syntax trees and highlight captures behind one interface, with the parser chosen per language: gotreesitter by default, C tree-sitter with `-tags jinter_cgo`, tsasm with `-tags jinter_tsasm` |
 | [`prefilter`](prefilter) | The keyword pre-pass |
 | [`jev`](jev) | Jev API client with an adaptive rate limiter and retries: `Ask` for search's Noul questions, `Decide` for any mix of Noul, Choice and Score questions about one state; `jevtest` fakes both |
 | [`cache`](cache) | SQLite and in-memory caches of answers and chunk layouts |
@@ -213,6 +214,30 @@ and HTML. Route languages to it with `$JINTER_PARSER` or
 `chunk.Options.Parsers`, e.g. `JINTER_PARSER='typescript=c,tsx=c'`, or
 `'*=c'` for every language it has; the rest stay on gotreesitter. A
 non-default routing gets its own cached chunk layouts.
+
+With `-tags jinter_tsasm` on linux/amd64, jinter also has tsasm, a
+tree-sitter parser runtime in x86-64 assembly, for Go, C, Java and JSON.
+It reads the same official grammars as the C backend, so where a file
+parses, the trees are the same. It has no error recovery: a file with
+syntax errors gets no tree, and jinter splits it as plain text, as it
+does a tree with errors. Its trees have no grammar fields or highlight
+captures, which chunking doesn't use. tsasm isn't a Go module: build its
+`libtsasm.a` and point cgo at its directory when building the program
+that uses jinter, then route to it:
+
+```
+CGO_LDFLAGS=-L$HOME/src/tsasm go build -tags jinter_tsasm .
+JINTER_PARSER='*=tsasm' ./yourprogram
+```
+
+With Go routed to tsasm, Go files skip go/parser and are parsed by tsasm
+alone, which is faster still (20-35% on Go's own source with 20 workers).
+The catch is the one go/parser was added for: the rare valid Go file that
+tree-sitter rejects is split as plain text. On Go's source, 17 of 7,710
+files split differently from the go/parser route, most of them
+type-checker test data.
+
+Both tags can be used together, e.g. `'*=c,go=tsasm,c=tsasm,java=tsasm,json=tsasm'`.
 
 `go run -tags jinter_cgo ./internal/parsebench <paths>` compares the
 backends on your code: speed, failures, and whether their trees agree.

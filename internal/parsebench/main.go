@@ -1,9 +1,11 @@
 // Command parsebench compares the parse backends on real code: speed on
 // one thread and on all of them, whether their trees agree, and how often
 // each fails. Build it with -tags jinter_cgo to compare C tree-sitter with
-// gotreesitter:
+// gotreesitter, and add jinter_tsasm for tsasm (its library's directory in
+// CGO_LDFLAGS):
 //
 //	go run -tags jinter_cgo ./internal/parsebench ~/src/repo-a ~/src/repo-b
+//	CGO_LDFLAGS=-L$TSASM go run -tags 'jinter_cgo jinter_tsasm' ./internal/parsebench .
 //
 // It parses the files jinter would search (gitignore respected, test files
 // included), grouped by language, and prints a Markdown table.
@@ -127,7 +129,7 @@ func pickBackends() ([]parse.Backend, error) {
 	for _, name := range strings.Split(*backendsFlag, ",") {
 		b := parse.Lookup(strings.TrimSpace(name))
 		if b == nil {
-			return nil, fmt.Errorf("no backend %q in this build; build with -tags jinter_cgo for c", name)
+			return nil, fmt.Errorf("no backend %q in this build; build with -tags jinter_cgo for c, jinter_tsasm for tsasm", name)
 		}
 		bs = append(bs, b)
 	}
@@ -229,6 +231,8 @@ func check(backends []parse.Backend, lang string, files []file) []stats {
 					switch {
 					case errors.Is(err, parse.ErrTimeout):
 						st.timeouts++
+					case errors.Is(err, parse.ErrSyntax): // no tree, as from tsasm
+						st.syntax++
 					case err != nil:
 						st.failed++
 					case syntax:

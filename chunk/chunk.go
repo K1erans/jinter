@@ -85,7 +85,8 @@ func (p piece) segment() bool { return p.hi > 0 }
 // Split cuts src into chunks. filename picks the tree-sitter grammar; files
 // without one, or that fail to parse, use a plain indentation splitter. Go
 // files are read with go/parser instead, which finds the same pieces many
-// times faster (see goCandidates).
+// times faster (see goCandidates), unless Go is routed to tsasm, which
+// parses them faster still.
 func Split(filename string, src []byte, opts Options) []Chunk {
 	chunks, _ := split(filename, src, opts, true)
 	return chunks
@@ -155,7 +156,7 @@ type candidate struct {
 func (s splitter) treePieces(filename string, src []byte, goParser bool) ([]piece, route) {
 	var cands []candidate
 	via := routePlain
-	if goParser && isGo(filename) {
+	if goParser && isGo(filename) && s.opts.goParserFirst() {
 		cands, via = s.goCandidates(filename, src)
 	}
 	if via == routePlain {

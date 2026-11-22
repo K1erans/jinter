@@ -33,6 +33,10 @@ var samples = []sample{
 		"function_item", []string{"f", "g"}, "type", "String"},
 }
 
+// fieldless says whether b's trees lack grammar fields and highlight
+// queries, as tsasm's do.
+func fieldless(b Backend) bool { return b.Name() == "tsasm" }
+
 // walk calls fn on every node under n, n included, in order.
 func walk(n Node, fn func(Node)) {
 	fn(n)
@@ -90,7 +94,7 @@ func TestBackendsReturnTheWholeTree(t *testing.T) {
 			if p := n.StartPoint(); offset(s.src, p) != int(n.StartByte()) {
 				t.Fatalf("%q starts at %+v, byte %d", n.Type(), p, n.StartByte())
 			}
-			if n.Type() == s.funcType {
+			if n.Type() == s.funcType && !fieldless(b) {
 				name := n.ChildByField("name")
 				if name.FieldName() != "name" {
 					t.Errorf("%q's name field is %q", tree.Text(name), name.FieldName())
@@ -98,7 +102,7 @@ func TestBackendsReturnTheWholeTree(t *testing.T) {
 				names = append(names, tree.Text(name))
 			}
 		})
-		if !slices.Equal(names, s.funcs) {
+		if !fieldless(b) && !slices.Equal(names, s.funcs) {
 			t.Errorf("functions %v, want %v", names, s.funcs)
 		}
 		if count < 10 {
@@ -146,6 +150,9 @@ func offset(src string, p Point) int {
 
 func TestBackendsRunTheirHighlightQuery(t *testing.T) {
 	eachBackend(t, func(t *testing.T, b Backend, s sample) {
+		if fieldless(b) {
+			t.Skip("no highlight query")
+		}
 		tree, err := b.Parse(context.Background(), s.lang, []byte(s.src), 0)
 		if err != nil {
 			t.Fatal(err)
@@ -173,6 +180,9 @@ func TestBackendsRunTheirHighlightQuery(t *testing.T) {
 func TestBackendsReturnTreesWithErrors(t *testing.T) {
 	for _, b := range Backends() {
 		t.Run(b.Name(), func(t *testing.T) {
+			if !b.Supports("python") {
+				t.Skip("no python grammar")
+			}
 			tree, err := b.Parse(context.Background(), "python", []byte("def f(:\n    return )\n"), 0)
 			if err != nil {
 				t.Fatal(err)
@@ -199,6 +209,20 @@ func bigPython() []byte {
 	return []byte(b.String())
 }
 
+// big is a file of 2000 functions, and nothing else at the top level, in
+// a language b parses: bigPython, or Go for a backend without Python.
+func big(b Backend) (lang string, src []byte) {
+	if b.Supports("python") {
+		return "python", bigPython()
+	}
+	var s strings.Builder
+	s.WriteString("package p\n")
+	for i := range 1999 {
+		fmt.Fprintf(&s, "\nfunc f%d(a int) int {\n\tif a > %d {\n\t\treturn a\n\t}\n\treturn %d\n}\n", i, i, i)
+	}
+	return "go", []byte(s.String())
+}
+
 func TestBackendsSayWhyThereIsNoTree(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -216,6 +240,9 @@ func TestBackendsSayWhyThereIsNoTree(t *testing.T) {
 				{"cancelled", cancelled, "python", 0, ErrCancelled},
 			}
 			for _, tc := range cases {
+				if tc.lang == "python" && !b.Supports("python") {
+					continue // tsasm's own test covers it
+				}
 				tree, err := b.Parse(tc.ctx, tc.lang, bigPython(), tc.timeout)
 				if tree != nil {
 					tree.Release()
@@ -233,7 +260,8 @@ func TestBackendsSayWhyThereIsNoTree(t *testing.T) {
 func TestWalkingAllocatesNothingPerNode(t *testing.T) {
 	for _, b := range Backends() {
 		t.Run(b.Name(), func(t *testing.T) {
-			tree, err := b.Parse(context.Background(), "python", bigPython(), 0)
+			lang, src := big(b)
+			tree, err := b.Parse(context.Background(), lang, src, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -305,13 +333,13 @@ func TestNullNodesAreEmpty(t *testing.T) {
 }
 
 func TestParseIsSafeForConcurrentUse(t *testing.T) {
-	src := bigPython()
 	for _, b := range Backends() {
 		t.Run(b.Name(), func(t *testing.T) {
+			lang, src := big(b)
 			errs := make(chan error, 8)
 			for range 8 {
 				go func() {
-					tree, err := b.Parse(context.Background(), "python", src, 0)
+					tree, err := b.Parse(context.Background(), lang, src, 0)
 					if err == nil {
 						if n := len(tree.Root().NamedChildren(nil)); n != 2000 {
 							err = fmt.Errorf("%d functions, want 2000", n)

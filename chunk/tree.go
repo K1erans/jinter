@@ -49,6 +49,13 @@ func (o Options) String() string {
 	return s + "}"
 }
 
+// goParserFirst says whether Split reads Go files with go/parser before
+// tree-sitter. It does unless Go is routed to tsasm: tsasm parses a whole
+// Go file faster than go/parser and the tree-sitter pass it leads to
+// (20-35% faster chunking on Go's own source with 20 workers), at the cost of
+// splitting the rare valid Go that tree-sitter rejects as plain text.
+func (o Options) goParserFirst() bool { return o.router().For("go").Name() != "tsasm" }
+
 // parseFile parses src with the backend o routes filename's language to.
 // It fails, and Split falls back to the plain splitter, when there is no
 // grammar, the parse stops early or times out, or the tree holds syntax

@@ -1,7 +1,8 @@
 // Package parse parses source files into syntax trees behind one interface,
 // so the parser behind it can be swapped per language and backends
-// compared: gotreesitter (pure Go, the default, every grammar it ships) and
-// C tree-sitter (with the jinter_cgo build tag, a few common grammars).
+// compared: gotreesitter (pure Go, the default, every grammar it ships),
+// C tree-sitter (with the jinter_cgo build tag, a few common grammars) and
+// tsasm (with the jinter_tsasm build tag, Go, C, Java and JSON).
 //
 // Callers see only this package's types. A Node is a small value that
 // refers into its Tree; walking a tree allocates nothing per node, so the
@@ -60,8 +61,8 @@ type Backend interface {
 	// Parse parses src as lang. timeout gives up on a runaway parse; 0
 	// means no limit. A parse that finishes returns its tree even when
 	// the tree holds syntax errors: check Root().HasError(). When there
-	// is no tree the error wraps ErrUnsupported, ErrTimeout, ErrCancelled
-	// or ErrStoppedEarly.
+	// is no tree the error wraps ErrUnsupported, ErrTimeout, ErrCancelled,
+	// ErrStoppedEarly or, from a backend without error recovery, ErrSyntax.
 	Parse(ctx context.Context, lang string, src []byte, timeout time.Duration) (*Tree, error)
 }
 
@@ -78,6 +79,9 @@ var (
 	// ErrStoppedEarly: the parser stopped at one of its own limits, or
 	// failed for another reason, before accepting the file.
 	ErrStoppedEarly = errors.New("parse: stopped early")
+	// ErrSyntax: the source has syntax errors, and the backend, which has
+	// no error recovery, made no tree. Only tsasm returns it.
+	ErrSyntax = errors.New("parse: syntax error")
 )
 
 // treeImpl is what a backend provides for its trees and their nodes.
