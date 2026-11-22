@@ -63,7 +63,7 @@ The fake Jev in the test knows only what the real one would: the call's path, ea
 | 5 (results) | `search/search.go`: `rank`, `topK`, the `scores` layout in `Run` |
 | Expected keys | `jev/jev.go`: `State`, `Instruction`; `cache/cache.go`: `KeyOf` |
 
-**Last confirmed in step with the code:** working tree on top of commit `d415e7d` (2026-11-21), which had uncommitted changes to these files. Their contents then, from `git hash-object <file>`:
+**Last confirmed in step with the code:** commit `9a54276` (2026-11-22). The covered files' contents at that commit, from `git hash-object <file>`:
 
 | File | Blob |
 |---|---|
@@ -71,7 +71,7 @@ The fake Jev in the test knows only what the real one would: the call's path, ea
 | `cache/cache.go` | `3fa4f624bfb3647300d38aa787335e502939bd86` |
 | `jev/jev.go` | `876b75fb5ac1ad19950d7c2cd8ebcabfedb77b41` |
 
-If `git hash-object` gives a different value for a file, it changed after the check was last confirmed: read the diff against the table above before trusting a pass. Once this work is committed, replace "working tree on top of" with that commit.
+If `git hash-object` gives a different value for a file, it changed after the check was last confirmed: read `git diff 9a54276 -- <file>` before trusting a pass, and update the commit and the table together.
 
 Move this record forward only after you have confirmed, by reading the changed code against the five requirements and the scope, that the test still describes what `Run` does. A passing run alone is not that confirmation: a new code path the scope never reaches also passes.
 
