@@ -1,0 +1,13 @@
+{
+  "name": "billing",
+  "version": 3,
+  "features": {
+    "refunds": true,
+    "discounts": ["spring", "loyalty"],
+    "limits": { "perDay": 100, "perOrder": 5 }
+  },
+  "owners": [
+    { "name": "a", "email": "a@example.com" },
+    { "name": "b", "email": "b@example.com" }
+  ]
+}

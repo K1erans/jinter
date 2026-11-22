@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Orders</title>
+    <style>
+      body { font: 14px sans-serif; }
+    </style>
+  </head>
+  <body>
+    <h1>Orders</h1>
+    <ul id="orders">
+      <li>One</li>
+      <li>Two</li>
+    </ul>
+    <script>
+      document.getElementById("orders").addEventListener("click", (e) => {
+        console.log(e.target.textContent);
+      });
+    </script>
+  </body>
+</html>
