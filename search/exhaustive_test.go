@@ -24,7 +24,8 @@ import (
 // The promise: whatever is already cached and however chunks are packed
 // into Jev calls, every (chunk, question) pair ends up with the answer Jev
 // gave for that chunk and that question, in the results and in the cache,
-// and Jev is asked about exactly the pairs the cache didn't have.
+// and Jev is asked about exactly the pairs the cache didn't have. OnMatch
+// hears each of those answers once, and Likely only reorders the calls.
 //
 // The scope is every search with
 //
@@ -36,7 +37,8 @@ import (
 //     overflow, and hold a chunk too big to share a call; equal codes in
 //     one file make two chunks share a cache key,
 //   - every subset of the cache keys answered beforehand,
-//   - ReadCache on and off, 1 and 3 workers,
+//   - ReadCache on and off, 1 and 3 workers, and 1 worker with Likely
+//     putting the calls that hold a chunk of the second or fourth code first,
 //   - Jev answering everything, or failing every call that carries one
 //     chosen chunk.
 //
@@ -100,14 +102,22 @@ type exCase struct {
 	cached    uint // bit i: the i-th distinct cache key was answered beforehand
 	readCache bool
 	workers   int
-	fail      int // Jev fails every call carrying this chunk; -1 for none
+	likely    bool // Likely is set, and picks exLikely's codes
+	fail      int  // Jev fails every call carrying this chunk; -1 for none
 }
+
+// exLikely is the Likely used when a case sets one: two of the four codes,
+// one small and one too big to share a call.
+func exLikely(code string) bool { return code == exCodes[1] || code == exCodes[3] }
 
 type exPair struct{ file, code, question int }
 
 func (c exCase) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d question(s), ReadCache=%v, Workers=%d", c.questions, c.readCache, c.workers)
+	if c.likely {
+		fmt.Fprintf(&b, ", Likely picks %q and %q", exCodeNames[1], exCodeNames[3])
+	}
 	if c.fail >= 0 {
 		fmt.Fprintf(&b, ", Jev fails calls carrying chunk %d", c.fail)
 	}
@@ -167,6 +177,7 @@ type exJev struct {
 	failRel, failCode string // fail calls for this file carrying this code
 	mu                sync.Mutex
 	asked             map[exPair]int
+	likely            []bool // for each call in order, whether it held a likely chunk
 	problems          []string
 }
 
@@ -182,10 +193,12 @@ func (j *exJev) Ask(_ context.Context, req jev.Request) (jev.Response, error) {
 	if req.Model != exModel {
 		j.problems = append(j.problems, fmt.Sprintf("a call used model %q", req.Model))
 	}
-	size, fail := 0, false
+	size, fail, likely := 0, false, false
 	nouls := make([][]float64, len(req.Chunks))
+	defer func() { j.likely = append(j.likely, likely) }()
 	for i, ch := range req.Chunks {
 		size += len(ch.Code)
+		likely = likely || exLikely(ch.Code)
 		code := slices.Index(exCodes[:], ch.Code)
 		if code < 0 {
 			return jev.Response{}, errors.New("unexpected code")
@@ -260,14 +273,60 @@ func (c exCase) check() (problems []string) {
 	if c.fail >= 0 {
 		client.failRel, client.failCode = exRel(c.files[c.fail]), exCodes[c.codes[c.fail]]
 	}
-	results, err := Run(context.Background(), chunks, client, store, Options{
+	// heard[c][q] are the probabilities OnMatch reported for chunk c and
+	// question q. Run promises its calls never overlap, so no lock: the
+	// race detector checks that promise.
+	heard := make([][][]float64, len(chunks))
+	for i := range heard {
+		heard[i] = make([][]float64, c.questions)
+	}
+	var strays []string
+	opts := Options{
 		Questions: exQuestions[:c.questions],
 		Model:     exModel,
 		ReadCache: c.readCache,
 		Workers:   c.workers,
-	})
+		OnMatch: func(question string, m Match) {
+			q := slices.Index(exQuestions[:c.questions], question)
+			i := slices.IndexFunc(chunks, func(ch Chunk) bool { return ch.Path == m.Path && ch.Start == m.Start && ch.End == m.End })
+			if q < 0 || i < 0 {
+				strays = append(strays, fmt.Sprintf("OnMatch heard %+v for question %q, which is no chunk or question of this search", m, question))
+				return
+			}
+			heard[i][q] = append(heard[i][q], m.Probability)
+		},
+	}
+	if c.likely {
+		opts.Likely = exLikely
+	}
+	results, err := Run(context.Background(), chunks, client, store, opts)
 	say := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 	problems = append(problems, client.problems...)
+	problems = append(problems, strays...)
+
+	// What OnMatch heard: each chunk's own answer, at most once, and
+	// exactly once when the search finished. This holds even when the
+	// search failed part-way.
+	for i := range chunks {
+		for q := range c.questions {
+			for _, v := range heard[i][q] {
+				if v != want[i][q] {
+					say("OnMatch heard %v for chunk %d question %s, but its answer is %v", v, i, exQuestions[q], want[i][q])
+				}
+			}
+			if n := len(heard[i][q]); n > 1 || (err == nil && n != 1) {
+				say("OnMatch heard about chunk %d question %s %d time(s), want 1", i, exQuestions[q], n)
+			}
+		}
+	}
+
+	// Likely only reorders: with one worker, every call holding a likely
+	// chunk is made before any call holding none.
+	if c.likely && c.workers == 1 {
+		if i := slices.Index(client.likely, false); i >= 0 && slices.Contains(client.likely[i:], true) {
+			say("call %d held no likely chunk, but a later call did: Likely should have put that one first", i)
+		}
+	}
 
 	// The cache: only answers Jev gave, each under its own chunk's key.
 	// This holds even when the search failed part-way.
@@ -406,7 +465,11 @@ func TestEveryAnswerLandsOnItsOwnChunk(t *testing.T) {
 				}
 				for c.cached = 0; c.cached < 1<<len(distinct); c.cached++ {
 					for _, c.readCache = range []bool{true, false} {
-						for _, c.workers = range []int{1, 3} {
+						for _, run := range []struct {
+							workers int
+							likely  bool
+						}{{1, false}, {3, false}, {1, true}} {
+							c.workers, c.likely = run.workers, run.likely
 							for c.fail = -1; c.fail < len(c.files); c.fail++ {
 								cases.Add(1)
 								if problems := c.check(); len(problems) > 0 {

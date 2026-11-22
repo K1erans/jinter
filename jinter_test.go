@@ -1,6 +1,7 @@
 package jinter
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -350,5 +351,34 @@ func TestPrepassKeepsMatchingChunksInOrder(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("kept %d chunks, want %d in order", len(got), len(want))
+	}
+}
+
+func TestOnMatchHearsEveryMatchInTheReport(t *testing.T) {
+	project(t, billing)
+	e, _ := engine(scorer())
+	var heard []search.Match
+	rep, err := e.Search(context.Background(), Query{
+		Questions: []string{"retries failed payments"},
+		Threshold: 0.5,
+		OnMatch: func(question string, m search.Match) {
+			if question != "retries failed payments" {
+				t.Errorf("heard a match for question %q", question)
+			}
+			heard = append(heard, m)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heard) == 0 {
+		t.Fatal("no match was heard; the test needs a search that matches")
+	}
+	byRank := func(a, b search.Match) int {
+		return cmp.Or(cmp.Compare(b.Probability, a.Probability), cmp.Compare(a.Path, b.Path), cmp.Compare(a.Start, b.Start))
+	}
+	slices.SortFunc(heard, byRank)
+	if !slices.Equal(heard, rep.Results[0].Matches) {
+		t.Fatalf("heard %+v\nreport has %+v", heard, rep.Results[0].Matches)
 	}
 }

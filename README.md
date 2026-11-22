@@ -58,6 +58,26 @@ func main() {
 
 Make one `Engine` and reuse it: its searches share one rate limiter.
 
+### Showing matches as they arrive
+
+A search returns once every chunk is answered. To show matches while it is
+still running, set `OnMatch`:
+
+```go
+rep, err := engine.Search(ctx, jinter.Query{
+	Questions: []string{"retries failed payments"},
+	Threshold: 0.6,
+	OnMatch: func(question string, m search.Match) {
+		fmt.Printf("found %.2f  %s:%d-%d\n", m.Probability, m.Path, m.Start, m.End)
+	},
+})
+```
+
+Cached answers are heard first, then each Jev call's as it returns. Chunks
+that share a word with the questions are asked about first, so the likely
+matches tend to come early. The matches arrive unranked and `Top` doesn't
+limit them; `rep` still has every match, best first.
+
 ## How a search works
 
 1. **List files.** Follows `.gitignore` and skips binaries, generated files
@@ -98,6 +118,7 @@ Make one `Engine` and reuse it: its searches share one rate limiter.
 | `NoCache` | Don't read cached answers (new answers are still saved) | off |
 | `OnFiles` | Hears which files were skipped or unreadable, before anything is sent to Jev | |
 | `OnAsk` | Hears how many chunks are about to be sent to Jev | |
+| `OnMatch` | Hears each match as soon as its answer is known, cached ones first, so results can be shown while the search runs. Chunks sharing words with the questions are asked about first. Unranked and not limited by `Top`; the `Report` is still complete and ranked | |
 | `OnCacheError` | Hears about cache failures, which never stop a search | |
 
 ## Report

@@ -39,11 +39,23 @@ func newLimits(clk *clock, requestsPerSecond, tokensPerSecond float64) *limits {
 		clock:   clk,
 		ceilReq: requestsPerSecond,
 		ceilTok: tokensPerSecond,
-		req:     rate.NewLimiter(0, 1),
-		tok:     rate.NewLimiter(0, 1),
 	}
-	l.set(1)
+	// A new limiter starts with its burst in hand, so the first calls of a
+	// search go out at once instead of trickling out at the steady rate.
+	r, t, reqBurst, tokBurst := l.rates(1)
+	l.share = 1
+	l.req = rate.NewLimiter(rate.Limit(r), reqBurst)
+	l.tok = rate.NewLimiter(rate.Limit(t), tokBurst)
 	return l
+}
+
+// rates are the limits and bursts for a share of the ceiling. Bursts
+// shrink with the rate, so a backed-off client can't send a burst sized
+// for full speed: requests get a tenth of a second's worth and tokens a
+// fifth.
+func (l *limits) rates(share float64) (req, tok float64, reqBurst, tokBurst int) {
+	req, tok = l.ceilReq*share, l.ceilTok*share
+	return req, tok, max(1, int(math.Ceil(req/10))), max(1, int(tok/5))
 }
 
 // wait blocks until one request of the given token cost may be sent. A
@@ -128,18 +140,15 @@ func (l *limits) recordSuccess() {
 	l.set(min(1, l.share+raiseStep))
 }
 
-// set applies a share of the ceiling. Bursts shrink with the rate, so a
-// backed-off client can't send a burst sized for full speed: requests get
-// a tenth of a second's worth and tokens a fifth. The caller holds mu, or
-// owns l outright.
+// set applies a share of the ceiling (see rates). The caller holds mu.
 func (l *limits) set(share float64) {
 	l.share = share
 	now := l.clock.now()
-	r, t := l.ceilReq*share, l.ceilTok*share
+	r, t, reqBurst, tokBurst := l.rates(share)
 	l.req.SetLimitAt(now, rate.Limit(r))
-	l.req.SetBurstAt(now, max(1, int(math.Ceil(r/10))))
+	l.req.SetBurstAt(now, reqBurst)
 	l.tok.SetLimitAt(now, rate.Limit(t))
-	l.tok.SetBurstAt(now, max(1, int(t/5)))
+	l.tok.SetBurstAt(now, tokBurst)
 }
 
 func (l *limits) current() (requestsPerSecond, tokensPerSecond float64) {

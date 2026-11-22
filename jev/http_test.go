@@ -662,3 +662,38 @@ func TestParseRetryAfter(t *testing.T) {
 		}
 	}
 }
+
+func TestANewClientSendsItsFirstBurstWithoutWaiting(t *testing.T) {
+	// 100 requests a second is a burst of 10, and 1,000,000 tokens a second
+	// a burst of 200,000, far more than ten small requests.
+	c, clk, _ := serve(t, HTTPOptions{RequestsPerSecond: 100, TokensPerSecond: 1e6}, okHandler)
+	for range 10 {
+		if _, err := c.Ask(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s := clk.sleeps(); len(s) != 0 {
+		t.Fatalf("the first burst waited %v", s)
+	}
+	if _, err := c.Ask(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if s := clk.sleeps(); len(s) != 1 || s[0] <= 0 || s[0] > 10*time.Millisecond {
+		t.Fatalf("the request after the burst slept %v, want one wait of up to 10ms", s)
+	}
+}
+
+func TestANewClientHasItsTokenBurstInHand(t *testing.T) {
+	// 50,000 tokens a second is a burst of 10,000: room for six ~1450-token
+	// requests at once.
+	c, clk, _ := serve(t, HTTPOptions{RequestsPerSecond: 1e6, TokensPerSecond: 50_000}, okHandler)
+	big := withCode(strings.Repeat("x", 3000))
+	for range 6 {
+		if _, err := c.Ask(context.Background(), big); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s := clk.sleeps(); len(s) != 0 {
+		t.Fatalf("the first burst waited %v", s)
+	}
+}

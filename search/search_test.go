@@ -490,3 +490,65 @@ func TestNarrowBreaksTiesByFileOrder(t *testing.T) {
 		t.Fatalf("n = 0: %+v, %v", got, err)
 	}
 }
+
+func TestOnMatchHearsMatchesAsTheyArriveAndCachedOnesFirst(t *testing.T) {
+	store := cache.NewMemory()
+	o := opts("retries failed payments", "sends email")
+	// Cache one question's answers, so the second search has both kinds.
+	first := o
+	first.Questions = o.Questions[:1]
+	if _, err := Run(context.Background(), chunks(), &jevtest.Fake{Score: scores(paymentScores)}, store, first); err != nil {
+		t.Fatal(err)
+	}
+
+	var heard []string
+	asked := false
+	o.Top = 1 // doesn't limit what OnMatch hears
+	o.OnAsk = func(int) { asked = true }
+	o.OnMatch = func(question string, m Match) {
+		when := "cached"
+		if asked {
+			when = "asked"
+		}
+		heard = append(heard, fmt.Sprintf("%s: %s %s %.2f", when, question, m.Path, m.Probability))
+	}
+	o.Workers = 1
+	results, err := Run(context.Background(), chunks(), &jevtest.Fake{Score: scores(paymentScores)}, store, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"cached: retries failed payments src/retry.ts 0.94",
+		"cached: retries failed payments src/worker.ts 0.81",
+		"asked: sends email src/worker.ts 0.70",
+	}
+	if !slices.Equal(heard, want) {
+		t.Fatalf("heard\n  %q\nwant\n  %q", heard, want)
+	}
+	if len(results[0].Matches) != 1 {
+		t.Fatalf("Top should still limit the results: %+v", results[0].Matches)
+	}
+}
+
+func TestLikelyChunksAreAskedAboutFirst(t *testing.T) {
+	fake := &jevtest.Fake{Score: scores(paymentScores)}
+	o := opts("retries failed payments")
+	o.Workers = 1
+	o.Likely = func(code string) bool { return strings.Contains(code, "email") || code == "http" }
+	results, err := Run(context.Background(), chunks(), fake, cache.NewMemory(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, r := range fake.Requests() {
+		order = append(order, r.Path)
+	}
+	// The likely files in file order, then the rest.
+	if want := []string{"app/src/worker.ts", "app/src/http.ts", "app/src/retry.ts"}; !slices.Equal(order, want) {
+		t.Fatalf("asked in order %q, want %q", order, want)
+	}
+	// The results don't depend on the order of asking.
+	if m := results[0].Matches; len(m) != 2 || m[0].Path != "src/retry.ts" || m[1].Path != "src/worker.ts" {
+		t.Fatalf("matches %+v", m)
+	}
+}

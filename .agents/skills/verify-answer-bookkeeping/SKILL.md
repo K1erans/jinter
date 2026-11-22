@@ -7,7 +7,7 @@ description: Check that search.Run still files every Jev answer under its own ch
 
 ## What is checked, and why it matters
 
-**The promise.** Whatever is already cached and however chunks are packed into Jev calls, every (chunk, question) pair ends up with the answer Jev gave for that chunk and that question, in the results and in the cache, and Jev is asked about exactly the pairs the cache did not have.
+**The promise.** Whatever is already cached and however chunks are packed into Jev calls, every (chunk, question) pair ends up with the answer Jev gave for that chunk and that question, in the results and in the cache, and Jev is asked about exactly the pairs the cache did not have. `OnMatch` hears each of those answers exactly once, and `Likely` changes only the order of Jev calls.
 
 **The harm if it breaks.** An answer filed under the wrong chunk or question is saved in the user's cache, so every later search silently reports wrong matches until the row expires. Asking again about cached pairs spends the user's Jev quota for nothing.
 
@@ -21,7 +21,7 @@ No verifier runs on this Go code (it uses generics, goroutines and the standard 
 go test ./search -run TestEveryAnswerLandsOnItsOwnChunk -count=1 -v
 ```
 
-About 5 seconds, about 750,000 searches, no tools beyond the Go toolchain in `go.mod`. It also runs as part of `go test ./...`. Under `-race` it uses bounds one chunk smaller so the race run stays at a few seconds.
+About 8 seconds, about 1.1 million searches, no tools beyond the Go toolchain in `go.mod`. It also runs as part of `go test ./...`. Under `-race` it uses bounds one chunk smaller so the race run stays at a few seconds.
 
 The code is in `search/exhaustive_test.go`; the bounds are in `search/exhaustive_bounds_test.go` and `search/exhaustive_bounds_race_test.go`.
 
@@ -31,7 +31,7 @@ The code is in `search/exhaustive_test.go`; the bounds are in `search/exhaustive
 - the chunks split across files in every way that keeps a file's chunks together;
 - each chunk's code one of four bodies: two small ones, one exactly half of `packBytes`, one bigger than `packBytes`. So packs fill exactly, overflow, and hold a chunk too big to share a call, and two chunks of a file with the same code share one cache key;
 - every subset of the cache keys answered beforehand;
-- `ReadCache` on and off, `Workers` 1 and 3;
+- `ReadCache` on and off, `Workers` 1 and 3, and 1 worker with `Likely` picking two of the four code bodies;
 - Jev answering everything, or failing every call that carries one chosen chunk.
 
 ### For each search it requires
@@ -41,6 +41,8 @@ The code is in `search/exhaustive_test.go`; the bounds are in `search/exhaustive
 3. Jev is asked once about each missing pair and never about a cached one; no chunk is sent with no question; no call with more than one chunk exceeds `packBytes`.
 4. If Jev fails a call the search needed, `Run` returns that error.
 5. Otherwise each question's result lists every chunk with its own answer (the cached one when `ReadCache` is on and it was cached), best first, and `Best` is the first of them.
+6. `OnMatch` hears each chunk's own answer for each question, never twice, and exactly once when the search finishes. Its calls are recorded without a lock, so `-race` checks that they never overlap.
+7. With `Likely` set and one worker, every call holding a likely chunk is made before any call holding none, and requirements 1 to 6 still hold.
 
 The fake Jev in the test knows only what the real one would: the call's path, each chunk's code, and its questions. Every (file, code, question) has its own answer value, and cached answers have values Jev never gives, so any mix-up changes a number.
 
@@ -48,7 +50,7 @@ The fake Jev in the test knows only what the real one would: the call's path, ea
 
 - Goroutine schedules are not enumerated: each case runs once per worker count. Run with `-race` for data races.
 - Searches bigger than the bounds. Nothing in `Run` depends on a count above 2, which is why the bounds were chosen, but that is an argument, not a check.
-- Jev returning the wrong number of answers, cancellation, `Top` and `Threshold`, `OnAsk`/`OnCacheError`, duplicate questions. Ordinary tests in `search/search_test.go` cover these.
+- Jev returning the wrong number of answers, cancellation, `Top` and `Threshold` (so `OnMatch` is only checked at threshold 0, where every answer is a match), `OnAsk`/`OnCacheError`, duplicate questions. Ordinary tests in `search/search_test.go` cover these.
 - That packing is as tight as it could be, only that it is never wrong or over the cap.
 - Stores other than the recording one in the test. SQLite's own behaviour is tested in `cache/`.
 - Whether cache keys stay the same between releases (`cache/key_test.go` pins those).
@@ -61,19 +63,21 @@ The fake Jev in the test knows only what the real one would: the call's path, ea
 | 3 (what Jev is asked) | `search/search.go`: `Run`'s cache-read loop that builds `tasks`, `packs`, `packBytes`, the request built in `ask` |
 | 4 (errors) | `search/search.go`: `parallel`, the error returns in `ask` |
 | 5 (results) | `search/search.go`: `rank`, `topK`, the `scores` layout in `Run` |
+| 6 (`OnMatch`) | `search/search.go`: `Run`'s `heard` closure, its calls in the cache-read loop and in `ask`, `matchOf` |
+| 7 (`Likely`) | `search/search.go`: `likelyFirst` |
 | Expected keys | `jev/jev.go`: `State`, `Instruction`; `cache/cache.go`: `KeyOf` |
 
-**Last confirmed in step with the code:** commit `9a54276` (2026-11-22). The covered files' contents at that commit, from `git hash-object <file>`:
+**Last confirmed in step with the code:** working tree on top of commit `c0e4320` (2026-11-22), with uncommitted changes to `search/search.go` that add `OnMatch` and `Likely`. The covered files' contents then, from `git hash-object <file>`:
 
 | File | Blob |
 |---|---|
-| `search/search.go` | `a8b76acaa9f6f685e6fa29e9c912f8cbc1dbb292` |
+| `search/search.go` | `d2647a471c2c42fd894e7a3b2ddb85683db6fddd` |
 | `cache/cache.go` | `3fa4f624bfb3647300d38aa787335e502939bd86` |
 | `jev/jev.go` | `876b75fb5ac1ad19950d7c2cd8ebcabfedb77b41` |
 
-If `git hash-object` gives a different value for a file, it changed after the check was last confirmed: read `git diff 9a54276 -- <file>` before trusting a pass, and update the commit and the table together.
+If `git hash-object` gives a different value for a file, it changed after the check was last confirmed: read the diff before trusting a pass, and update this paragraph and the table together. Once that work is committed, name the commit here instead of the working tree.
 
-Move this record forward only after you have confirmed, by reading the changed code against the five requirements and the scope, that the test still describes what `Run` does. A passing run alone is not that confirmation: a new code path the scope never reaches also passes.
+Move this record forward only after you have confirmed, by reading the changed code against the seven requirements and the scope, that the test still describes what `Run` does. A passing run alone is not that confirmation: a new code path the scope never reaches also passes.
 
 ## When you change the covered code
 
@@ -100,7 +104,7 @@ Move this record forward only after you have confirmed, by reading the changed c
 
 - New `Options` field or packing rule: add a dimension to `exCase` and a loop for it in `TestEveryAnswerLandsOnItsOwnChunk`, and state the expected outcome in `exCase.check` without calling the code under test.
 - Keep the run under about 10 seconds. The count multiplies fast: one more chunk at two questions is roughly 60 times more searches.
-- After any edit to the check, prove it can still fail. Break `search/search.go` on purpose, run the command, see it fail, and restore the file (copy it aside first; do not use `git checkout` if there are uncommitted changes). These eight breaks were all caught when the check was written, and each should still be:
+- After any edit to the check, prove it can still fail. Break `search/search.go` on purpose, run the command, see it fail, and restore the file (copy it aside first; do not use `git checkout` if there are uncommitted changes). These twelve breaks were all caught when the check was last changed, and each should still be:
 
   | Break in `search/search.go` | What the check reports |
   |---|---|
@@ -112,5 +116,9 @@ Move this record forward only after you have confirmed, by reading the changed c
   | always add a question to `t.missing`, even on a cache hit | Jev asked about a cached pair |
   | send `questions[len(questions)-1-q]` | answers swapped between questions |
   | remove the final `save()` in `ask` | a pair was cached 0 times, want 1 |
+| `heard(t.chunk, q)` → `heard(pack[0].chunk, q)` in `ask` | OnMatch heard another chunk's answer |
+| drop `heard(c, q)` from the cache-read loop | OnMatch heard about a cached pair 0 times, want 1 |
+| `[]bool{true, false}` → `[]bool{false, true}` in `likelyFirst` | a call with no likely chunk came before one with |
+| `[]bool{true, false}` → `[]bool{true}` in `likelyFirst` | Jev was asked 0 times about a missing pair |
 
 Then update the coverage record.

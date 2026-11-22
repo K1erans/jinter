@@ -125,6 +125,15 @@ type Query struct {
 
 	// OnAsk hears how many chunks are about to be sent to Jev, when any are.
 	OnAsk func(chunks int)
+
+	// OnMatch hears each chunk that reaches Threshold for a question as
+	// soon as its answer is known, so callers can show matches while the
+	// search is still running. Chunks that share words with the questions
+	// are asked about first, so the probable matches tend to arrive early.
+	// Matches come in no order of rank and Top doesn't limit them; the
+	// Report is still complete and ranked. Calls never overlap, with each
+	// other or with OnCacheError.
+	OnMatch func(question string, m search.Match)
 }
 
 // Report is a search's results and what it left out.
@@ -256,6 +265,15 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 	if client == nil {
 		client = noClient{}
 	}
+	// Asking first about chunks that share a word with the questions only
+	// matters to a caller watching matches arrive, and not after a keyword
+	// Prepass, when every chunk left shares one.
+	var likely func(string) bool
+	if q.OnMatch != nil && !(q.Prepass && q.Keywords == "") {
+		if f, err := prefilter.New("", q.Questions); err == nil {
+			likely = f.Keep
+		}
+	}
 	rep.Results, err = search.Run(ctx, chunks, client, store, search.Options{
 		Questions:    q.Questions,
 		Model:        model,
@@ -264,6 +282,8 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		ReadCache:    !q.NoCache,
 		OnCacheError: onCacheError,
 		OnAsk:        q.OnAsk,
+		OnMatch:      q.OnMatch,
+		Likely:       likely,
 	})
 	return rep, err
 }

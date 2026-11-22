@@ -50,6 +50,20 @@ type Options struct {
 
 	// OnAsk hears how many chunks are about to be sent to Jev, when any are.
 	OnAsk func(chunks int)
+
+	// OnMatch hears each chunk that reaches Threshold for a question as
+	// soon as its answer is known, so callers can show matches while the
+	// search is still running: cached answers first, then each Jev call's
+	// as it returns. They come in no order of rank and Top doesn't limit
+	// them; Run's results are still complete and ranked. Calls never
+	// overlap, with each other or with OnCacheError.
+	OnMatch func(question string, m Match)
+
+	// Likely marks chunks to ask Jev about first, so that with OnMatch the
+	// probable matches arrive early. It only changes the order of Jev
+	// calls, never which chunks are asked about. It is called from many
+	// goroutines at once.
+	Likely func(code string) bool
 }
 
 type Match struct {
@@ -102,12 +116,19 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 			return nil, fmt.Errorf("reading cache: %w", err)
 		}
 	}
+	// heard tells OnMatch about chunk c's answer to question q.
+	heard := func(c, q int) {
+		if opts.OnMatch != nil && scores[c][q] >= opts.Threshold {
+			opts.OnMatch(questions[q], matchOf(chunks[c], scores[c][q]))
+		}
+	}
 	var tasks []task
 	for c := range chunks {
 		t := task{chunk: c}
 		for q := range questions {
 			if v, ok := hits[keys[c][q]]; ok {
 				scores[c][q] = v
+				heard(c, q)
 			} else {
 				t.missing = append(t.missing, q)
 			}
@@ -118,12 +139,12 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 	}
 
 	// Answers arrive on many workers at once; callers needn't make
-	// OnCacheError safe for concurrent use.
-	var cacheErrMu sync.Mutex
+	// OnCacheError or OnMatch safe for concurrent use.
+	var callbacks sync.Mutex
 	cacheError := func(err error) {
 		if opts.OnCacheError != nil {
-			cacheErrMu.Lock()
-			defer cacheErrMu.Unlock()
+			callbacks.Lock()
+			defer callbacks.Unlock()
 			opts.OnCacheError(err)
 		}
 	}
@@ -169,6 +190,13 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 				scores[t.chunk][q] = resp.Nouls[i][j]
 				answers = append(answers, cache.Answer{Key: keys[t.chunk][q], Noul: resp.Nouls[i][j]})
 			}
+			if opts.OnMatch != nil {
+				callbacks.Lock()
+				for _, q := range t.missing {
+					heard(t.chunk, q)
+				}
+				callbacks.Unlock()
+			}
 		}
 		save()
 		return nil
@@ -180,7 +208,11 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 	if workers <= 0 {
 		workers = DefaultWorkers
 	}
-	if err := parallel(ctx, packs(chunks, tasks), workers, ask); err != nil {
+	calls := packs(chunks, tasks)
+	if opts.Likely != nil {
+		calls = likelyFirst(ctx, chunks, calls, opts.Likely)
+	}
+	if err := parallel(ctx, calls, workers, ask); err != nil {
 		return nil, err
 	}
 
@@ -206,6 +238,26 @@ func packs(chunks []Chunk, tasks []task) [][]task {
 		}
 		out = append(out, []task{t})
 		size = len(c.Code)
+	}
+	return out
+}
+
+// likelyFirst moves the calls holding a likely chunk ahead of the rest,
+// keeping file order within each group.
+func likelyFirst(ctx context.Context, chunks []Chunk, calls [][]task, likely func(code string) bool) [][]task {
+	first := make([]bool, len(calls))
+	if each(ctx, len(calls), func(i int) {
+		first[i] = slices.ContainsFunc(calls[i], func(t task) bool { return likely(chunks[t.chunk].Code) })
+	}) != nil {
+		return calls // cancelled: nothing will be asked anyway
+	}
+	out := make([][]task, 0, len(calls))
+	for _, want := range []bool{true, false} {
+		for i, call := range calls {
+			if first[i] == want {
+				out = append(out, call)
+			}
+		}
 	}
 	return out
 }
@@ -328,6 +380,10 @@ feed:
 	return context.Cause(ctx)
 }
 
+func matchOf(ch Chunk, probability float64) Match {
+	return Match{Path: ch.Path, Start: ch.Start, End: ch.End, Signature: ch.Signature, Probability: probability}
+}
+
 // rank finds the best chunk in one pass and sorts only the matches it
 // keeps: with Top set, it picks them out without sorting the rest, which
 // matters at the default threshold of 0, where every chunk matches.
@@ -336,10 +392,7 @@ func rank(question string, chunks []Chunk, scores [][]float64, q int, opts Optio
 	if len(chunks) == 0 {
 		return res
 	}
-	match := func(c int) Match {
-		ch := chunks[c]
-		return Match{Path: ch.Path, Start: ch.Start, End: ch.End, Signature: ch.Signature, Probability: scores[c][q]}
-	}
+	match := func(c int) Match { return matchOf(chunks[c], scores[c][q]) }
 	// better orders chunks best first. The chunk index breaks the last
 	// ties, so the order never depends on how the sort works.
 	better := func(a, b int) int {
