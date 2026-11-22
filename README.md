@@ -63,9 +63,14 @@ Make one `Engine` and reuse it: its searches share one rate limiter.
 1. **List files.** Follows `.gitignore` and skips binaries, generated files
    (lockfiles, source maps, minified files, SVGs, `node_modules`) and
    translation catalogs. Tests and docs are skipped unless asked for, or
-   unless a question is about tests.
+   unless a question is about tests. A file or folder that can't be read
+   is reported in `Report.Unreadable` and the search carries on; a path
+   you name in `Paths` that is missing or can't be read is an error.
 2. **Split** each file into function- or block-sized chunks with
-   tree-sitter (206 grammars). Files with no grammar are split at
+   tree-sitter (206 grammars). Go files are read with the standard
+   library's `go/parser` instead, which is many times faster and finds the
+   same chunks; tree-sitter only opens up declarations too big for one
+   chunk. Files with no grammar, or that fail to parse, are split at
    unindented lines.
 3. **Narrow**, optionally, with a keyword pre-pass (`Prepass`) or to the
    chunks that best matched an earlier question (`Refine`).
@@ -91,7 +96,7 @@ Make one `Engine` and reuse it: its searches share one rate limiter.
 | `MaxFileSize` | Skip larger files; negative means no limit | 1 MB |
 | `Model` | Jev version | `jev-1.13.0` |
 | `NoCache` | Don't read cached answers (new answers are still saved) | off |
-| `OnFiles` | Hears which files were skipped, before anything is sent to Jev | |
+| `OnFiles` | Hears which files were skipped or unreadable, before anything is sent to Jev | |
 | `OnAsk` | Hears how many chunks are about to be sent to Jev | |
 | `OnCacheError` | Hears about cache failures, which never stop a search | |
 
@@ -104,6 +109,7 @@ Make one `Engine` and reuse it: its searches share one rate limiter.
 | `Chunks`, `Split` | Chunks searched, and chunks before `Prepass` and `Refine` |
 | `Keywords` | The pattern the pre-pass used |
 | `Oversize`, `Tests`, `Docs`, `Generated`, `Translations` | What was skipped, so you can tell the user. Nothing is skipped silently |
+| `Unreadable` | Files and folders that couldn't be read (permission denied, for example), each with its `Path`, `Rel` and `Err`. The rest are still searched |
 | `TestsIncluded` | Tests were searched because a question was about them |
 
 ## Caching
@@ -116,6 +122,23 @@ re-asks only that function.
 The default folder is `~/Library/Caches/jinter` on macOS (the user cache
 folder elsewhere); set `$JINTER_CACHE_DIR` to move it. To keep the cache
 somewhere else, or in memory, set `Engine.OpenCache`.
+
+A store of your own implements `cache.Cache`:
+
+```go
+type Cache interface {
+	Get(keys []Key) (map[Key]float64, error)
+	PutAnswers(answers []Answer) error // one call's answers; a key may repeat, with the same value
+	GetChunks(keys []Key) (map[Key][]byte, error)
+	PutChunks(layouts map[Key][]byte) error
+}
+```
+
+`PutAnswers` gets every answer from one Jev call as soon as the call
+returns, so a store can save them in one write and an interrupted search
+keeps its progress. Keep the answer already stored for a key: the key pins
+the model, question and code. A failed write is passed to `OnCacheError`
+and doesn't stop the search.
 
 ## Testing without the API
 

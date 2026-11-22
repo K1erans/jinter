@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,10 +26,10 @@ func open(t *testing.T, path, model string) *SQLite {
 func TestAnswersPersistAcrossOpens(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "repo.db")
 	c := open(t, path, "jev-1.13.0")
-	if err := c.Put(key(1), 0.94); err != nil {
+	if err := c.PutAnswers([]Answer{{key(1), 0.94}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Put(key(1), 0.10); err != nil {
+	if err := c.PutAnswers([]Answer{{key(1), 0.10}}); err != nil {
 		t.Fatal(err)
 	}
 	c.Close()
@@ -51,7 +52,7 @@ func TestGetLooksUpManyKeysAtOnce(t *testing.T) {
 	for i := range 5000 {
 		keys = append(keys, key(i))
 		if i%2 == 0 {
-			if err := c.Put(key(i), float64(i)/5000); err != nil {
+			if err := c.PutAnswers([]Answer{{key(i), float64(i) / 5000}}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -74,8 +75,8 @@ func TestCleanupDropsStaleAndOtherModelRowsOnceADay(t *testing.T) {
 
 	at(0)
 	c := open(t, path, "A")
-	c.Put(key(1), 0.1)
-	c.Put(key(2), 0.2)
+	c.PutAnswers([]Answer{{key(1), 0.1}})
+	c.PutAnswers([]Answer{{key(2), 0.2}})
 	c.Close()
 
 	at(20 * day) // using key 2 keeps it fresh
@@ -115,7 +116,7 @@ func TestPathAndClear(t *testing.T) {
 		t.Fatalf("paths %s %s", a, b)
 	}
 	c := open(t, a, "m")
-	c.Put(key(1), 0.5)
+	c.PutAnswers([]Answer{{key(1), 0.5}})
 	c.Close()
 	if err := Clear(a); err != nil {
 		t.Fatal(err)
@@ -142,7 +143,7 @@ func TestHelperWriter(t *testing.T) {
 		if i < 100 {
 			k = i // shared by every process
 		}
-		if err := c.Put(key(k), float64(k)); err != nil {
+		if err := c.PutAnswers([]Answer{{key(k), float64(k)}}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := c.Get([]Key{key(k)}); err != nil {
@@ -225,5 +226,123 @@ func TestChunkLayoutsPersistAndAgeOut(t *testing.T) {
 	got, _ = c.GetChunks([]Key{key(1), key(2)})
 	if len(got) != 1 || got[key(2)] != nil {
 		t.Fatalf("after 31 days only the layout used on day 20 should be left, got %q", got)
+	}
+}
+
+// TestPathsWithURICharacters checks that Open uses the file it's given
+// when the path holds characters SQLite's URI filenames treat specially.
+func TestPathsWithURICharacters(t *testing.T) {
+	for _, name := range []string{"a?b", "a#b", "a%41b", "a b"} {
+		path := filepath.Join(t.TempDir(), name, "repo.db")
+		c, err := Open(path, "m")
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		err = c.PutAnswers([]Answer{{key(1), 0.5}})
+		c.Close()
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s: database not where asked: %v", name, err)
+		}
+	}
+}
+
+// TestGetRefreshesRowsInEveryBatch looks up more keys than one batch
+// holds, with duplicates, and checks every row found is kept fresh.
+func TestGetRefreshesRowsInEveryBatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo.db")
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) { now = func() time.Time { return t0.Add(d) } }
+	defer func() { now = time.Now }()
+	day := 24 * time.Hour
+	const n = 2*lookupBatch + 7
+
+	at(0)
+	c := open(t, path, "m")
+	var keys []Key
+	layouts := map[Key][]byte{}
+	for i := range n {
+		keys = append(keys, key(i), key(i)) // each twice
+		layouts[key(i)] = []byte(strconv.Itoa(i))
+		if err := c.PutAnswers([]Answer{{key(i), float64(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.PutChunks(layouts); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	at(20 * day)
+	c = open(t, path, "m")
+	answers, err := c.Get(append(keys, key(n))) // key n was never saved
+	if err != nil || len(answers) != n || answers[key(n-1)] != n-1 {
+		t.Fatalf("got %d answers, %v", len(answers), err)
+	}
+	got, err := c.GetChunks(keys)
+	if err != nil || len(got) != n || string(got[key(n-1)]) != strconv.Itoa(n-1) {
+		t.Fatalf("got %d layouts, %v", len(got), err)
+	}
+	c.Close()
+
+	at(31 * day) // cleanup keeps what was used on day 20
+	c = open(t, path, "m")
+	defer c.Close()
+	if answers, _ := c.Get(keys); len(answers) != n {
+		t.Fatalf("%d of %d answers survived", len(answers), n)
+	}
+	if got, _ := c.GetChunks(keys); len(got) != n {
+		t.Fatalf("%d of %d layouts survived", len(got), n)
+	}
+	if got, err := c.Get(nil); err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("no keys: got %v, %v", got, err)
+	}
+}
+
+// TestPutAnswersSavesACallInOneGo saves a batch holding a repeated key and
+// a key already stored: the stored answer and its last_used stay, as they
+// did when answers were saved one at a time, and new rows get last_used now.
+func TestPutAnswersSavesACallInOneGo(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) { now = func() time.Time { return t0.Add(d) } }
+	defer func() { now = time.Now }()
+
+	at(0)
+	c := open(t, filepath.Join(t.TempDir(), "repo.db"), "m")
+	defer c.Close()
+	mem := NewMemory()
+	for _, s := range []Cache{c, mem} {
+		if err := s.PutAnswers([]Answer{{key(1), 0.1}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutAnswers(nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at(time.Hour)
+	batch := []Answer{{key(2), 0.2}, {key(1), 0.9}, {key(3), 0.3}, {key(2), 0.2}}
+	for _, s := range []Cache{c, mem} {
+		if err := s.PutAnswers(batch); err != nil {
+			t.Fatalf("%T: %v", s, err)
+		}
+		got, err := s.Get([]Key{key(1), key(2), key(3)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := map[Key]float64{key(1): 0.1, key(2): 0.2, key(3): 0.3}; !maps.Equal(got, want) {
+			t.Fatalf("%T: got %v, want %v", s, got, want)
+		}
+	}
+	for k, want := range map[Key]time.Duration{key(1): 0, key(2): time.Hour, key(3): time.Hour} {
+		var used int64
+		if err := c.db.QueryRow(`SELECT last_used FROM answers WHERE key = ?`, k[:]).Scan(&used); err != nil {
+			t.Fatal(err)
+		}
+		if used != t0.Add(want).Unix() {
+			t.Errorf("last_used is %v, want %v", time.Unix(used, 0).Sub(t0), want)
+		}
 	}
 }

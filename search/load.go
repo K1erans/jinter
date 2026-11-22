@@ -1,6 +1,8 @@
 package search
 
 import (
+	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +11,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/K1erans/jinter/cache"
 	"github.com/K1erans/jinter/chunk"
@@ -33,11 +37,17 @@ type LoadOptions struct {
 // Load reads (unless the walk already did) and chunks files in parallel,
 // keeping file order. A file that vanished since it was listed is skipped.
 func Load(files []walk.File, opts LoadOptions) ([]Chunk, error) {
+	return LoadContext(context.Background(), files, opts)
+}
+
+// LoadContext is Load, but stops reading and splitting files once ctx is
+// done and returns its error. Layouts split before then are still saved.
+func LoadContext(ctx context.Context, files []walk.File, opts LoadOptions) ([]Chunk, error) {
 	srcs := make([][]byte, len(files))
 	keys := make([]cache.Key, len(files))
 	errs := make([]error, len(files))
 	version := layoutVersion(opts.Chunk)
-	each(len(files), func(i int) {
+	if err := each(ctx, len(files), func(i int) {
 		src := files[i].Src
 		if src == nil {
 			var err error
@@ -53,7 +63,9 @@ func Load(files []walk.File, opts LoadOptions) ([]Chunk, error) {
 		srcs[i] = src
 		// The name picks the grammar, so it is part of the key.
 		keys[i] = cache.Hash(version, []byte(filepath.Base(files[i].Path)), src)
-	})
+	}); err != nil {
+		return nil, err
+	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
@@ -66,9 +78,19 @@ func Load(files []walk.File, opts LoadOptions) ([]Chunk, error) {
 		}
 	}
 
-	per := make([][]Chunk, len(files))
+	// Biggest files first: parse time grows with size, and one slow file
+	// started last would hold up the whole load while the other workers
+	// sit idle.
+	order := make([]int, len(files))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(len(srcs[b]), len(srcs[a])) })
+
+	per := make([][]chunk.Chunk, len(files))
 	fresh := make([][]byte, len(files)) // layouts to save
-	each(len(files), func(i int) {
+	stopped := each(ctx, len(order), func(j int) {
+		i := order[j]
 		f, src := files[i], srcs[i]
 		if src == nil {
 			return
@@ -78,10 +100,7 @@ func Load(files []walk.File, opts LoadOptions) ([]Chunk, error) {
 			cs = chunk.Split(f.Path, src, opts.Chunk)
 			fresh[i] = encodeLayout(cs)
 		}
-		per[i] = make([]Chunk, len(cs))
-		for j, c := range cs {
-			per[i][j] = Chunk{Path: f.Path, Rel: f.Rel, Chunk: c}
-		}
+		per[i] = cs
 	})
 
 	if opts.Store != nil {
@@ -91,14 +110,25 @@ func Load(files []walk.File, opts LoadOptions) ([]Chunk, error) {
 				save[keys[i]] = l
 			}
 		}
-		if err := opts.Store.PutChunks(save); err != nil {
-			opts.cacheError(fmt.Errorf("saving chunk cache: %w", err))
+		if len(save) > 0 {
+			if err := opts.Store.PutChunks(save); err != nil {
+				opts.cacheError(fmt.Errorf("saving chunk cache: %w", err))
+			}
 		}
 	}
+	if stopped != nil {
+		return nil, stopped
+	}
 
-	var out []Chunk
+	n := 0
 	for _, cs := range per {
-		out = append(out, cs...)
+		n += len(cs)
+	}
+	out := make([]Chunk, 0, n)
+	for i, cs := range per {
+		for _, c := range cs {
+			out = append(out, Chunk{Path: files[i].Path, Rel: files[i].Rel, Chunk: c})
+		}
 	}
 	return out, nil
 }
@@ -109,24 +139,34 @@ func (o LoadOptions) cacheError(err error) {
 	}
 }
 
-// each runs fn(0) … fn(n-1) on one worker per CPU.
-func each(n int, fn func(int)) {
-	next := make(chan int)
+// each runs fn(0) … fn(n-1), in that order, on one worker per CPU. It stops
+// starting new calls once ctx is done, and returns ctx's error if any call
+// was skipped.
+func each(ctx context.Context, n int, fn func(int)) error {
+	done := ctx.Done()
+	var next atomic.Int64
 	var wg sync.WaitGroup
 	for range min(runtime.GOMAXPROCS(0), n) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range next {
+		wg.Go(func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				i := int(next.Add(1)) - 1
+				if i >= n {
+					return
+				}
 				fn(i)
 			}
-		}()
+		})
 	}
-	for i := range n {
-		next <- i
-	}
-	close(next)
 	wg.Wait()
+	if next.Load() < int64(n) {
+		return ctx.Err()
+	}
+	return nil
 }
 
 // layout is one chunk without its code, which is read back from the
@@ -158,7 +198,7 @@ func decodeLayout(b []byte, src []byte) ([]chunk.Chunk, bool) {
 	code := string(src)
 	cs := make([]chunk.Chunk, len(ls))
 	for i, l := range ls {
-		if l.Offset < 0 || l.Len < 0 || l.Offset+l.Len > len(code) {
+		if l.Offset < 0 || l.Len < 0 || l.Offset > len(code) || l.Len > len(code)-l.Offset {
 			return nil, false
 		}
 		cs[i] = chunk.Chunk{Start: l.Start, End: l.End, Signature: l.Signature, Code: code[l.Offset : l.Offset+l.Len], Offset: l.Offset}

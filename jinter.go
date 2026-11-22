@@ -10,7 +10,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 
 	"github.com/K1erans/jinter/cache"
@@ -111,11 +115,12 @@ type Query struct {
 	NoCache     bool // don't read cached answers (still writes them)
 
 	// OnCacheError hears about cache failures, which don't stop a search.
+	// Calls never overlap.
 	OnCacheError func(error)
 
 	// OnFiles hears which files were left out as soon as they are listed,
 	// before any chunk is sent to Jev, so callers can say so up front. Only
-	// Repo, TestsIncluded and the skipped files are set.
+	// Repo, TestsIncluded and the skipped and unreadable files are set.
 	OnFiles func(Report)
 
 	// OnAsk hears how many chunks are about to be sent to Jev, when any are.
@@ -143,6 +148,12 @@ type Report struct {
 	Generated    int
 	Translations int
 	Docs         int
+
+	// Unreadable are the files and folders found under Paths that couldn't
+	// be read, such as ones without read permission, each with its error.
+	// The search carries on without them. A path named in Query.Paths that
+	// is missing or can't be read fails the search instead.
+	Unreadable []walk.Unreadable
 }
 
 // Matched reports whether any question had a match.
@@ -157,7 +168,7 @@ func (r Report) Matched() bool {
 
 // Search runs q.
 func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
-	if len(q.Questions) == 0 {
+	if !slices.ContainsFunc(q.Questions, func(s string) bool { return strings.TrimSpace(s) != "" }) {
 		return Report{}, errors.New("no question")
 	}
 	paths := q.Paths
@@ -188,6 +199,7 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		Generated:     files.Generated,
 		Translations:  files.Translations,
 		Docs:          files.Docs,
+		Unreadable:    files.Unreadable,
 	}
 	if q.OnFiles != nil {
 		q.OnFiles(rep)
@@ -202,9 +214,13 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		onCacheError(fmt.Errorf("cache unavailable, answers won't be saved: %w", err))
 		store, closeStore = cache.NewMemory(), func() error { return nil }
 	}
-	defer closeStore()
+	defer func() {
+		if err := closeStore(); err != nil {
+			onCacheError(fmt.Errorf("closing cache: %w", err))
+		}
+	}()
 
-	chunks, err := search.Load(files.Files, search.LoadOptions{
+	chunks, err := search.LoadContext(ctx, files.Files, search.LoadOptions{
 		Chunk:        chunk.Default,
 		Store:        store,
 		ReadCache:    !q.NoCache,
@@ -220,16 +236,16 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 			return rep, fmt.Errorf("prepass: %w", err)
 		}
 		rep.Keywords = f.Pattern()
-		kept := chunks[:0:0]
-		for _, c := range chunks {
-			if f.Keep(c.Code) {
-				kept = append(kept, c)
-			}
+		if chunks, err = prepass(ctx, chunks, f); err != nil {
+			return rep, err
 		}
-		chunks = kept
 	}
 	if q.Refine != "" {
-		chunks, err = search.Narrow(chunks, store, model, q.Refine, cmp.Or(q.RefineTop, DefaultRefineTop))
+		top := q.RefineTop
+		if top <= 0 {
+			top = DefaultRefineTop
+		}
+		chunks, err = search.Narrow(chunks, store, model, q.Refine, top)
 		if err != nil {
 			return rep, fmt.Errorf("refine %q: %w", q.Refine, err)
 		}
@@ -250,6 +266,36 @@ func (e *Engine) Search(ctx context.Context, q Query) (Report, error) {
 		OnAsk:        q.OnAsk,
 	})
 	return rep, err
+}
+
+// prepass keeps the chunks f matches, in order. Matching a keyword regexp
+// runs at only a few MB/s, seconds on a big repo, so it runs on every CPU.
+func prepass(ctx context.Context, chunks []search.Chunk, f *prefilter.Filter) ([]search.Chunk, error) {
+	keep := make([]bool, len(chunks))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(runtime.GOMAXPROCS(0), len(chunks)) {
+		wg.Go(func() {
+			for ctx.Err() == nil {
+				i := int(next.Add(1)) - 1
+				if i >= len(chunks) {
+					return
+				}
+				keep[i] = f.Keep(chunks[i].Code)
+			}
+		})
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var kept []search.Chunk
+	for i, c := range chunks {
+		if keep[i] {
+			kept = append(kept, c)
+		}
+	}
+	return kept, nil
 }
 
 // noClient stands in when Engine.Client is nil, so searches answered

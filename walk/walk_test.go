@@ -1,6 +1,8 @@
 package walk
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -452,5 +454,225 @@ func TestTranslationsAreSkippedUnlessNamed(t *testing.T) {
 	res, _ = Walk([]string{"internal/locale/translations", "po/nl.po"}, Options{})
 	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"internal/locale/translations/de.json", "po/nl.po"}) {
 		t.Fatalf("translations named explicitly are searched: %v", got)
+	}
+}
+
+func TestOutsideGitRulesApplyHoweverTheFolderIsWritten(t *testing.T) {
+	dir := t.TempDir()
+	tree(t, dir, map[string]string{
+		"src/.gitignore":     "secret.txt\n/top.txt\n",
+		"src/secret.txt":     "s\n",
+		"src/sub/secret.txt": "s\n",
+		"src/top.txt":        "s\n",
+		"src/sub/top.txt":    "ok\n", // /top.txt is anchored to src
+		"src/ok.txt":         "ok\n",
+	})
+	t.Chdir(dir)
+
+	want := []string{"src/.gitignore", "src/ok.txt", "src/sub/top.txt"}
+	for _, p := range []string{"src", "src/", "./src", "src/../src"} {
+		res, err := Walk([]string{p}, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := paths(res.Files); !reflect.DeepEqual(got, want) {
+			t.Errorf("walking %q: got %v\nwant %v", p, got, want)
+		}
+	}
+}
+
+func TestNamesStartingWithDotsAreInsideTheirFolder(t *testing.T) {
+	dir := t.TempDir()
+	tree(t, dir, map[string]string{
+		".gitignore": "/..cache\n",
+		"..cache":    "x\n",
+		"..env":      "x\n",
+	})
+	t.Chdir(dir)
+
+	res, err := Walk([]string{"."}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := paths(res.Files); !reflect.DeepEqual(got, []string{"..env", ".gitignore"}) {
+		t.Fatalf("an anchored rule applies to a name starting with dots: %v", got)
+	}
+	if err := os.Mkdir("sub", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir("sub")
+	res, err = Walk([]string{"../..env"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rels(res.Files); !reflect.DeepEqual(got, []string{"..env"}) {
+		t.Fatalf("a named file starting with dots is keyed from the root: %v", got)
+	}
+}
+
+// lock takes away all permissions from paths under dir until the test ends.
+// Root can read them anyway, so tests using it skip as root.
+func lock(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root can read files without permission")
+	}
+	for _, name := range names {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		// Runs before t.TempDir's own cleanup, which couldn't remove them.
+		t.Cleanup(func() { os.Chmod(p, info.Mode().Perm()) })
+	}
+}
+
+func unreadable(t *testing.T, list []Unreadable) (paths, rels []string) {
+	t.Helper()
+	for _, u := range list {
+		paths = append(paths, u.Path)
+		rels = append(rels, u.Rel)
+		if !errors.Is(u.Err, fs.ErrPermission) {
+			t.Errorf("%s: want a permission error, got %v", u.Path, u.Err)
+		}
+	}
+	return paths, rels
+}
+
+func TestUnreadableFilesAndFoldersAreReportedAndTheWalkCarriesOn(t *testing.T) {
+	files := map[string]string{
+		".gitignore":          "ignored/\n",
+		"a.go":                "package a\n",
+		"secret.go":           "package a\n",
+		"sub/ok.go":           "package sub\n",
+		"sub/locked/x.go":     "package locked\n",
+		"ignored/x.go":        "package ignored\n", // never opened, so not reported
+		"sub/secret_test.go":  "package sub\n",     // reported though it would be skipped as a test
+		"sub/locked2/deep.go": "package deep\n",
+	}
+	for _, inGit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "outside git", true: "in git"}[inGit], func(t *testing.T) {
+			dir := t.TempDir()
+			tree(t, dir, files)
+			want := []string{"secret.go", "sub/locked", "sub/locked2", "sub/secret_test.go"}
+			if inGit {
+				git(t, dir, "init", "-q")
+				// Tracked files in a locked folder are listed by git, so
+				// they are reported too.
+				git(t, dir, "add", "a.go", "secret.go", "sub/locked2/deep.go")
+				want = []string{"secret.go", "sub/locked", "sub/locked2", "sub/locked2/deep.go", "sub/secret_test.go"}
+			}
+			lock(t, dir, "secret.go", "sub/secret_test.go", "sub/locked", "sub/locked2", "ignored")
+			t.Chdir(dir)
+
+			res, err := Walk([]string{"."}, Options{})
+			if err != nil {
+				t.Fatalf("an unreadable file must not fail the walk: %v", err)
+			}
+			if got := paths(res.Files); !reflect.DeepEqual(got, []string{".gitignore", "a.go", "sub/ok.go"}) {
+				t.Fatalf("the readable files are still listed: %v", got)
+			}
+			gotPaths, gotRels := unreadable(t, res.Unreadable)
+			if !reflect.DeepEqual(gotPaths, want) || !reflect.DeepEqual(gotRels, want) {
+				t.Fatalf("unreadable paths %v rels %v\nwant %v", gotPaths, gotRels, want)
+			}
+			if res.Tests != 0 {
+				t.Errorf("an unreadable test file isn't counted as a test: %d", res.Tests)
+			}
+
+			// Walking a subfolder, paths are shown as given and Rel is from
+			// the root: the repo's top in git (which names the folders it
+			// couldn't open from there), the subfolder outside.
+			res, err = Walk([]string{"sub"}, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := paths(res.Files); !reflect.DeepEqual(got, []string{"sub/ok.go"}) {
+				t.Fatalf("files %v", got)
+			}
+			gotPaths, gotRels = unreadable(t, res.Unreadable)
+			wantPaths := []string{"sub/locked", "sub/locked2", "sub/secret_test.go"}
+			wantRels := []string{"locked", "locked2", "secret_test.go"}
+			if inGit {
+				wantPaths = []string{"sub/locked", "sub/locked2", "sub/locked2/deep.go", "sub/secret_test.go"}
+				wantRels = wantPaths
+			}
+			if !reflect.DeepEqual(gotPaths, wantPaths) || !reflect.DeepEqual(gotRels, wantRels) {
+				t.Fatalf("walking sub: unreadable paths %v rels %v\nwant %v and %v", gotPaths, gotRels, wantPaths, wantRels)
+			}
+		})
+	}
+}
+
+func TestUnreadableNamedPathsAreErrors(t *testing.T) {
+	for _, inGit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "outside git", true: "in git"}[inGit], func(t *testing.T) {
+			dir := t.TempDir()
+			tree(t, dir, map[string]string{"a.go": "package a\n", "secret.go": "package a\n", "locked/x.go": "package x\n"})
+			if inGit {
+				git(t, dir, "init", "-q")
+			}
+			lock(t, dir, "secret.go", "locked")
+			t.Chdir(dir)
+
+			// Named first or after a folder that lists it, a named file that
+			// can't be read is an error, like a missing one.
+			for _, ps := range [][]string{{"secret.go"}, {"a.go", "secret.go"}, {".", "secret.go"}} {
+				if _, err := Walk(ps, Options{}); !errors.Is(err, fs.ErrPermission) {
+					t.Errorf("walking %v: got %v, want a permission error", ps, err)
+				}
+			}
+			if _, err := Walk([]string{"locked"}, Options{}); !errors.Is(err, fs.ErrPermission) {
+				t.Errorf("walking a named locked folder: got %v, want a permission error", err)
+			}
+		})
+	}
+}
+
+func TestInspectReadsWholeTextFiles(t *testing.T) {
+	dir := t.TempDir()
+	head := make([]byte, binarySniffLen)
+	for _, size := range []int{0, 1, binarySniffLen - 1, binarySniffLen, binarySniffLen + 1, 100_000} {
+		p := filepath.Join(dir, "f.txt")
+		body := []byte(strings.Repeat("abcdefg\n", size/8+1)[:size])
+		if err := os.WriteFile(p, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, isText, err := inspect(p, true, 0, head)
+		if err != nil || !isText {
+			t.Fatalf("size %d: text %v, err %v", size, isText, err)
+		}
+		if f.Src == nil || string(f.Src) != string(body) || f.Size != int64(size) {
+			t.Errorf("size %d: read %d bytes (nil %v), size %d", size, len(f.Src), f.Src == nil, f.Size)
+		}
+
+		f, _, _ = inspect(p, false, 0, head)
+		if f.Src != nil {
+			t.Errorf("size %d: read without being asked to", size)
+		}
+		if size > 1 {
+			f, isText, _ = inspect(p, true, int64(size-1), head)
+			if !isText || f.Src != nil {
+				t.Errorf("size %d: an oversize text file is reported but not read (text %v, %d bytes)", size, isText, len(f.Src))
+			}
+		}
+	}
+
+	bin := filepath.Join(dir, "b.bin")
+	if err := os.WriteFile(bin, append([]byte(strings.Repeat("a", 100)), 0), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, isText, err := inspect(bin, true, 0, head); isText || err != nil {
+		t.Errorf("a NUL in the head marks a binary: text %v, err %v", isText, err)
+	}
+	if _, isText, err := inspect(filepath.Join(dir, "gone"), true, 0, head); isText || err != nil {
+		t.Errorf("a missing file is skipped: text %v, err %v", isText, err)
+	}
+	if _, isText, err := inspect(dir, true, 0, head); isText || err != nil {
+		t.Errorf("a folder is skipped: text %v, err %v", isText, err)
 	}
 }

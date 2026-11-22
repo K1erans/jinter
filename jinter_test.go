@@ -4,15 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/K1erans/jinter/cache"
+	"github.com/K1erans/jinter/chunk"
 	"github.com/K1erans/jinter/jev"
 	"github.com/K1erans/jinter/jev/jevtest"
+	"github.com/K1erans/jinter/prefilter"
+	"github.com/K1erans/jinter/search"
+	"github.com/K1erans/jinter/walk"
 )
 
 // project writes a small non-git source tree and moves into it.
@@ -214,5 +220,135 @@ func TestSkippedFilesAreReportedBeforeJevIsAsked(t *testing.T) {
 	}
 	if want := []string{"files: 1 tests skipped", "ask: 2"}; !slices.Equal(events, want) {
 		t.Fatalf("got %q, want %q", events, want)
+	}
+}
+
+func TestUnreadableFilesAreReportedAndTheRestSearched(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read files without permission")
+	}
+	for _, inGit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "outside git", true: "in git"}[inGit], func(t *testing.T) {
+			project(t, billing)
+			if inGit {
+				cmd := exec.Command("git", "init", "-q")
+				cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git init: %v\n%s", err, out)
+				}
+			}
+			secret := filepath.Join("src", "billing", "secret.go")
+			if err := os.WriteFile(secret, []byte("package billing\n\nfunc charge(id string) error { return nil }\n"), 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.Chmod(secret, 0o644) })
+
+			e, _ := engine(scorer())
+			var heard []walk.Unreadable
+			rep, err := e.Search(context.Background(), Query{
+				Questions: []string{"retries failed payments"},
+				Threshold: 0.6,
+				OnFiles:   func(r Report) { heard = r.Unreadable },
+			})
+			if err != nil {
+				t.Fatalf("an unreadable file must not fail the search: %v", err)
+			}
+			if m := rep.Results[0].Matches; len(m) != 1 || m[0].Path != "src/billing/retry.go" {
+				t.Fatalf("the readable files are still searched: %+v", m)
+			}
+			for name, got := range map[string][]walk.Unreadable{"report": rep.Unreadable, "OnFiles": heard} {
+				if len(got) != 1 || got[0].Path != secret || got[0].Rel != "src/billing/secret.go" || !errors.Is(got[0].Err, fs.ErrPermission) {
+					t.Errorf("%s: unreadable %+v", name, got)
+				}
+			}
+
+			if _, err := e.Search(context.Background(), Query{Questions: []string{"retries failed payments"}, Paths: []string{secret}}); !errors.Is(err, fs.ErrPermission) {
+				t.Errorf("a named unreadable file: got %v, want a permission error", err)
+			}
+		})
+	}
+}
+
+func TestBlankQuestionsAreRejected(t *testing.T) {
+	project(t, billing)
+	fake := scorer()
+	e, _ := engine(fake)
+	if _, err := e.Search(context.Background(), Query{Questions: []string{"", "  \t"}}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if n := len(fake.Requests()); n != 0 {
+		t.Fatalf("made %d calls", n)
+	}
+}
+
+func TestNegativeRefineTopTakesTheDefault(t *testing.T) {
+	project(t, billing)
+	e, _ := engine(scorer())
+	ctx := context.Background()
+	if _, err := e.Search(ctx, Query{Questions: []string{"retries failed payments"}}); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := e.Search(ctx, Query{Questions: []string{"x"}, Refine: "retries failed payments", RefineTop: -1})
+	if err != nil || rep.Chunks != 2 {
+		t.Fatalf("err %v, chunks %d", err, rep.Chunks)
+	}
+}
+
+func TestACancelledSearchAsksNothing(t *testing.T) {
+	project(t, billing)
+	fake := scorer()
+	e, _ := engine(fake)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.Search(ctx, Query{Questions: []string{"retries failed payments"}, Prepass: true}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if n := len(fake.Requests()); n != 0 {
+		t.Fatalf("made %d calls", n)
+	}
+}
+
+func TestAFailedCacheCloseIsReported(t *testing.T) {
+	project(t, billing)
+	e := &Engine{Client: scorer(), OpenCache: func(string, string) (cache.Cache, func() error, error) {
+		return cache.NewMemory(), func() error { return errors.New("close failed") }, nil
+	}}
+	var cacheErr error
+	if _, err := e.Search(context.Background(), Query{
+		Questions:    []string{"retries failed payments"},
+		OnCacheError: func(err error) { cacheErr = err },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cacheErr == nil || !strings.Contains(cacheErr.Error(), "close failed") {
+		t.Fatalf("cache error %v", cacheErr)
+	}
+}
+
+func TestPrepassKeepsMatchingChunksInOrder(t *testing.T) {
+	f, err := prefilter.New("pay", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunks []search.Chunk
+	var want []string
+	for i := range 1000 {
+		code := fmt.Sprintf("chunk %d", i)
+		if i%7 == 0 {
+			code += " pay"
+			want = append(want, code)
+		}
+		chunks = append(chunks, search.Chunk{Path: "a.go", Chunk: chunk.Chunk{Code: code}})
+	}
+	kept, err := prepass(context.Background(), chunks, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range kept {
+		got = append(got, c.Code)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("kept %d chunks, want %d in order", len(got), len(want))
 	}
 }

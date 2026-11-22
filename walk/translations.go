@@ -29,7 +29,7 @@ func IsTranslation(rel string) bool {
 	if !translationDataExts[ext] {
 		return false
 	}
-	for _, part := range strings.Split(strings.Trim(dir, "/"), "/") {
+	for part := range strings.SplitSeq(strings.Trim(dir, "/"), "/") {
 		if translationDirs[strings.ToLower(part)] {
 			return true
 		}

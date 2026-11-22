@@ -1,7 +1,6 @@
 package walk
 
 import (
-	"bufio"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,24 +24,34 @@ func (rs *ruleSet) ignored(path string, isDir bool) bool {
 	if rs == nil {
 		return false
 	}
-	ignored := false
-	for _, r := range rs.rules {
+	name := filepath.Base(path)
+	// The last matching rule decides, so search from the end. Rules from
+	// one .gitignore share a base and sit together, so path's rel from a
+	// base is worked out once, not once per anchored rule.
+	var base, rel string
+	for i := len(rs.rules) - 1; i >= 0; i-- {
+		r := &rs.rules[i]
 		if r.dirOnly && !isDir {
 			continue
 		}
-		subject := filepath.Base(path)
+		subject := name
 		if r.anchor {
-			rel, err := filepath.Rel(r.base, path)
-			if err != nil || strings.HasPrefix(rel, "..") {
-				continue
+			if r.base != base {
+				base, rel = r.base, ""
+				if p, err := filepath.Rel(base, path); err == nil && !escapes(p) {
+					rel = filepath.ToSlash(p)
+				}
 			}
-			subject = filepath.ToSlash(rel)
+			if rel == "" {
+				continue // path isn't under the rule's folder
+			}
+			subject = rel
 		}
 		if r.re.MatchString(subject) {
-			ignored = !r.negate
+			return !r.negate
 		}
 	}
-	return ignored
+	return false
 }
 
 // with returns the rules for dir: rs plus dir's own .gitignore, if any.
@@ -60,15 +69,13 @@ func (rs *ruleSet) with(dir string) *ruleSet {
 }
 
 func readGitignore(dir string) []rule {
-	f, err := os.Open(filepath.Join(dir, ".gitignore"))
+	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
 	var rules []rule
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if r, ok := parseRule(dir, sc.Text()); ok {
+	for line := range strings.Lines(string(data)) {
+		if r, ok := parseRule(dir, line); ok {
 			rules = append(rules, r)
 		}
 	}
@@ -76,7 +83,7 @@ func readGitignore(dir string) []rule {
 }
 
 func parseRule(base, line string) (rule, bool) {
-	line = strings.TrimRight(line, " \t\r")
+	line = strings.TrimRight(line, " \t\r\n")
 	if line == "" || strings.HasPrefix(line, "#") {
 		return rule{}, false
 	}

@@ -11,6 +11,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,7 +30,7 @@ type HTTPOptions struct {
 	BaseURL           string        // default DefaultBaseURL
 	TokensPerSecond   float64       // ceiling; default 400,000
 	RequestsPerSecond float64       // ceiling; default 320
-	MaxRetries        int           // default 6
+	MaxRetries        int           // default 6; negative means none
 	BaseBackoff       time.Duration // first retry delay, doubled each time; default 500 ms
 	MaxBackoff        time.Duration // default 10 s
 	Timeout           time.Duration // per attempt; default 60 s
@@ -45,13 +47,21 @@ const (
 	bytesPerToken         = 2.75
 )
 
+// maxIdleConns is how many connections the client keeps open for reuse.
+// http.DefaultTransport keeps two per host, so over HTTP/1.1 all but two of
+// search's 128 concurrent calls would redial, and redo TLS, every time.
+const maxIdleConns = 256
+
 // HTTP is the Jev client for TypeSafe's API. It is safe for concurrent use;
-// all callers share one adaptive rate limiter.
+// all callers share one adaptive rate limiter and one connection pool.
 type HTTP struct {
-	key    string
-	opts   HTTPOptions
-	http   *http.Client
-	limits *limits
+	key      string
+	opts     HTTPOptions
+	endpoint string
+	badURL   error // set when BaseURL can't work, so Ask fails at once
+	http     *http.Client
+	clock    *clock
+	limits   *limits
 }
 
 func NewHTTP(apiKey string, opts HTTPOptions) *HTTP {
@@ -62,28 +72,39 @@ func NewHTTP(apiKey string, opts HTTPOptions) *HTTP {
 	opts.BaseBackoff = cmp.Or(opts.BaseBackoff, 500*time.Millisecond)
 	opts.MaxBackoff = cmp.Or(opts.MaxBackoff, 10*time.Second)
 	opts.Timeout = cmp.Or(opts.Timeout, 60*time.Second)
-	return &HTTP{
-		key:    apiKey,
-		opts:   opts,
-		http:   &http.Client{Timeout: opts.Timeout},
-		limits: newLimits(opts.RequestsPerSecond, opts.TokensPerSecond),
+	clk := &clock{now: time.Now, sleep: sleep}
+	c := &HTTP{
+		key:      apiKey,
+		opts:     opts,
+		endpoint: opts.BaseURL + "/v1/systemone",
+		http:     &http.Client{Timeout: opts.Timeout, Transport: newTransport()},
+		clock:    clk,
+		limits:   newLimits(clk, opts.RequestsPerSecond, opts.TokensPerSecond),
 	}
+	if u, err := url.Parse(c.endpoint); err != nil {
+		c.badURL = fmt.Errorf("jev: bad BaseURL: %w", err)
+	} else if u.Scheme != "http" && u.Scheme != "https" {
+		c.badURL = fmt.Errorf("jev: BaseURL %q needs an http or https scheme", opts.BaseURL)
+	}
+	return c
+}
+
+// newTransport is http.DefaultTransport with room to keep a connection
+// idle for every call in flight.
+func newTransport() http.RoundTripper {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return http.DefaultTransport
+	}
+	t = t.Clone()
+	t.MaxIdleConns = maxIdleConns
+	t.MaxIdleConnsPerHost = maxIdleConns
+	return t
 }
 
 // Limits is the rate the client is currently allowing itself.
 func (c *HTTP) Limits() (requestsPerSecond, tokensPerSecond float64) {
 	return c.limits.current()
-}
-
-type question struct {
-	Type         string `json:"type"`
-	Instructions string `json:"instructions"`
-}
-
-type requestBody struct {
-	Model     string              `json:"model"`
-	State     json.RawMessage     `json:"state"`
-	Questions map[string]question `json:"questions"`
 }
 
 type responseBody struct {
@@ -128,23 +149,11 @@ func retryable(err error) bool {
 }
 
 func (c *HTTP) Ask(ctx context.Context, req Request) (Response, error) {
-	state, err := encodeState(req)
-	if err != nil {
-		return Response{}, err
+	if c.badURL != nil {
+		return Response{}, c.badURL
 	}
-	body := requestBody{Model: req.Model, State: state, Questions: map[string]question{}}
-	n := 0
-	for i, ch := range req.Chunks {
-		for _, q := range ch.Questions {
-			body.Questions[id(n)] = question{Type: "noul", Instructions: instruction(field(req, i), q)}
-			n++
-		}
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return Response{}, err
-	}
-	tokens := requestOverheadTokens + int(math.Ceil(float64(len(payload))/bytesPerToken))
+	payload, n := encodeRequest(req)
+	tokens := cost(payload)
 
 	for attempt := 0; ; attempt++ {
 		if err := c.limits.wait(ctx, tokens); err != nil {
@@ -161,13 +170,18 @@ func (c *HTTP) Ask(ctx context.Context, req Request) (Response, error) {
 		if ctx.Err() != nil {
 			return Response{}, ctx.Err()
 		}
-		if !retryable(err) || attempt == c.opts.MaxRetries {
+		if !retryable(err) || attempt >= c.opts.MaxRetries {
 			return Response{}, err
 		}
-		if err := sleep(ctx, c.backoff(attempt, err)); err != nil {
+		if err := c.clock.sleep(ctx, c.backoff(attempt, err)); err != nil {
 			return Response{}, err
 		}
 	}
+}
+
+// cost is the number of tokens Jev will count for payload.
+func cost(payload []byte) int {
+	return requestOverheadTokens + int(math.Ceil(float64(len(payload))/bytesPerToken))
 }
 
 // field names chunk i in the state: a lone chunk is "code", exactly as it
@@ -181,29 +195,62 @@ func field(req Request, i int) string {
 	return "code_" + strconv.Itoa(i+1)
 }
 
-// encodeState writes the path, then each chunk's field in order.
-func encodeState(req Request) (json.RawMessage, error) {
-	var b bytes.Buffer
-	b.WriteString(`{"path":`)
-	if err := writeJSON(&b, req.Path); err != nil {
-		return nil, err
-	}
+// encodeRequest writes the request body and returns it with its number of
+// questions, q0 to q(n-1), numbered across every chunk's questions in turn.
+// The state holds the path, then each chunk's field in order.
+//
+// The bytes are exactly what json.Marshal makes of the struct
+//
+//	{Model string; State json.RawMessage; Questions map[string]{Type, Instructions string}}
+//
+// (with the usual json tags), which is how the body used to be built and how
+// the token estimate was fitted, but written straight into one buffer: no map
+// of questions, and no second pass over the code to validate the state.
+func encodeRequest(req Request) ([]byte, int) {
+	type question struct{ id, instructions string }
+	var qs []question
+	size := len(req.Model) + len(req.Path) + 64
 	for i, ch := range req.Chunks {
-		b.WriteByte(',')
-		writeJSON(&b, field(req, i))
-		b.WriteByte(':')
-		if err := writeJSON(&b, ch.Code); err != nil {
-			return nil, err
+		f := field(req, i)
+		size += len(f) + len(ch.Code) + 8
+		for _, q := range ch.Questions {
+			in := instruction(f, q)
+			qs = append(qs, question{id(len(qs)), in})
+			size += len(in) + 48
 		}
 	}
-	b.WriteByte('}')
-	return b.Bytes(), nil
-}
+	// json.Marshal writes map keys in sorted order: q0, q1, q10, q11, …, q2.
+	slices.SortFunc(qs, func(a, b question) int { return strings.Compare(a.id, b.id) })
 
-func writeJSON(b *bytes.Buffer, s string) error {
-	v, err := json.Marshal(s)
-	b.Write(v)
-	return err
+	var b bytes.Buffer
+	b.Grow(size + size/8) // room for some escaping
+	enc := json.NewEncoder(&b)
+	str := func(s string) {
+		enc.Encode(s) // can't fail for a string; escapes HTML as json.Marshal does
+		b.Truncate(b.Len() - 1)
+	}
+	b.WriteString(`{"model":`)
+	str(req.Model)
+	b.WriteString(`,"state":{"path":`)
+	str(req.Path)
+	for i, ch := range req.Chunks {
+		b.WriteByte(',')
+		str(field(req, i))
+		b.WriteByte(':')
+		str(ch.Code)
+	}
+	b.WriteString(`},"questions":{`)
+	for i, q := range qs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		str(q.id)
+		b.WriteString(`:{"type":"noul","instructions":`)
+		str(q.instructions)
+		b.WriteByte('}')
+	}
+	b.WriteString(`}}`)
+	return b.Bytes(), len(qs)
 }
 
 // perChunk splits answers, numbered across every chunk's questions in
@@ -216,9 +263,17 @@ func perChunk(req Request, nouls []float64) [][]float64 {
 	return out
 }
 
+// Reply bodies are read up to maxBody, which drains any normal reply so the
+// connection can be reused. An error reply's body is quoted in the error up
+// to maxErrorBody: a proxy's HTML error page can run to many kilobytes.
+const (
+	maxBody      = 1 << 20
+	maxErrorBody = 1 << 10
+)
+
 // post sends payload and reads the model and n answers, q0 to q(n-1).
 func (c *HTTP) post(ctx context.Context, payload []byte, n int) (string, []float64, error) {
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.opts.BaseURL+"/v1/systemone", bytes.NewReader(payload))
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return "", nil, err
 	}
@@ -230,15 +285,19 @@ func (c *HTTP) post(ctx context.Context, payload []byte, n int) (string, []float
 		return "", nil, err
 	}
 	defer hresp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(hresp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(hresp.Body, maxBody))
 	if err != nil {
 		return "", nil, err
 	}
 	if hresp.StatusCode/100 != 2 {
+		body := strings.TrimSpace(string(raw))
+		if len(body) > maxErrorBody {
+			body = strings.ToValidUTF8(body[:maxErrorBody], "") + "…"
+		}
 		return "", nil, &statusError{
 			status:     hresp.StatusCode,
-			body:       strings.TrimSpace(string(raw)),
-			retryAfter: parseRetryAfter(hresp.Header.Get("Retry-After")),
+			body:       body,
+			retryAfter: parseRetryAfter(hresp.Header.Get("Retry-After"), c.clock.now()),
 		}
 	}
 	var rb responseBody
@@ -261,7 +320,12 @@ func id(i int) string { return "q" + strconv.Itoa(i) }
 // backoff doubles from BaseBackoff with jitter, capped at MaxBackoff. A
 // retry-after header wins when it asks for longer.
 func (c *HTTP) backoff(attempt int, err error) time.Duration {
-	d := min(c.opts.BaseBackoff<<attempt, c.opts.MaxBackoff)
+	base, ceil := max(c.opts.BaseBackoff, 0), max(c.opts.MaxBackoff, 0)
+	d := ceil
+	// Shifting past the cap would overflow on a late attempt.
+	if attempt < 63 && base <= ceil>>attempt {
+		d = base << attempt
+	}
 	d = d/2 + time.Duration(rand.Int64N(int64(d/2)+1))
 	var se *statusError
 	if errors.As(err, &se) && se.retryAfter > d {
@@ -270,21 +334,35 @@ func (c *HTTP) backoff(attempt int, err error) time.Duration {
 	return d
 }
 
-// parseRetryAfter reads delay-seconds or an HTTP date.
-func parseRetryAfter(v string) time.Duration {
+// parseRetryAfter reads delay-seconds or an HTTP date, as of now.
+func parseRetryAfter(v string, now time.Time) time.Duration {
 	if v == "" {
 		return 0
 	}
-	if s, err := strconv.ParseFloat(v, 64); err == nil && s > 0 {
-		return time.Duration(s * float64(time.Second))
+	if s, err := strconv.ParseFloat(v, 64); err == nil {
+		// The bound keeps the conversion from overflowing (and rules out +Inf).
+		if s > 0 && s < float64(math.MaxInt64/time.Second) {
+			return time.Duration(s * float64(time.Second))
+		}
+		return 0
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		return time.Until(t)
+		return max(t.Sub(now), 0)
 	}
 	return 0
 }
 
+// clock is the client's time source, shared with its limiter. Tests swap in
+// a fake so that waiting for the rate limit or a backoff takes no real time.
+type clock struct {
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+}
+
 func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

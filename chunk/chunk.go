@@ -49,7 +49,10 @@ var Default = Options{MinLines: 10, MaxLines: 300, MaxBytes: 48 << 10, ParseTime
 
 // Version names how Split cuts files. Bump it whenever the same file could
 // split differently, so chunk layouts cached by search.Load aren't reused.
-const Version = 1
+//
+// 2: Go files go through go/parser, so valid Go that tree-sitter rejects
+// gets real chunks instead of the plain splitter's.
+const Version = 2
 
 const maxSignature = 100
 
@@ -73,25 +76,44 @@ type piece struct {
 func (p piece) segment() bool { return p.hi > 0 }
 
 // Split cuts src into chunks. filename picks the tree-sitter grammar; files
-// without one, or that fail to parse, use a plain indentation splitter.
+// without one, or that fail to parse, use a plain indentation splitter. Go
+// files are read with go/parser instead, which finds the same pieces many
+// times faster (see goCandidates).
 func Split(filename string, src []byte, opts Options) []Chunk {
+	chunks, _ := split(filename, src, opts, true)
+	return chunks
+}
+
+// route is how split found a file's pieces.
+type route int
+
+const (
+	routePlain  route = iota // the plain splitter
+	routeTree                // tree-sitter, over the whole file
+	routeGo                  // go/parser alone
+	routeGoTree              // go/parser, and tree-sitter to open up big declarations
+)
+
+// split is Split. With goParser false it parses Go files with tree-sitter
+// like any other, which tests compare against.
+func split(filename string, src []byte, opts Options, goParser bool) ([]Chunk, route) {
 	text := string(src)
 	lines := strings.Split(text, "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
 	if len(lines) == 0 {
-		return nil
+		return nil, routePlain
 	}
 	s := splitter{text: text, lines: lines, starts: make([]int, len(lines)), opts: opts}
 	for r := 1; r < len(lines); r++ {
 		s.starts[r] = s.starts[r-1] + len(lines[r-1]) + 1
 	}
-	pieces, ok := s.treePieces(filename, src)
-	if !ok {
+	pieces, via := s.treePieces(filename, src, goParser)
+	if via == routePlain {
 		pieces = s.fallbackPieces()
 	}
-	return s.emit(s.merge(s.limit(pieces)))
+	return s.emit(s.merge(s.limit(pieces))), via
 }
 
 type splitter struct {
@@ -101,12 +123,12 @@ type splitter struct {
 	opts   Options
 }
 
+// rowBytes is the length of rows start..end joined by newlines.
 func (s splitter) rowBytes(start, end int) int {
-	n := 0
-	for r := start; r <= end; r++ {
-		n += len(s.lines[r]) + 1
+	if end < start {
+		return 0
 	}
-	return n - 1
+	return s.starts[end] + len(s.lines[end]) - s.starts[start]
 }
 
 func (s splitter) tooBig(start, end int) bool {
@@ -121,16 +143,25 @@ type candidate struct {
 	comment bool
 }
 
-// treePieces splits at syntax nodes.
-func (s splitter) treePieces(filename string, src []byte) (pieces []piece, ok bool) {
-	bt, ok := parse(filename, src, s.opts.ParseTimeout)
-	if !ok {
-		return nil, false
+// treePieces splits at syntax nodes and says how it found them; routePlain
+// means it couldn't.
+func (s splitter) treePieces(filename string, src []byte, goParser bool) ([]piece, route) {
+	var cands []candidate
+	via := routePlain
+	if goParser && isGo(filename) {
+		cands, via = s.goCandidates(filename, src)
 	}
-	defer bt.Release()
-	cands := s.candidates(bt, bt.RootNode(), "")
+	if via == routePlain {
+		bt, ok := parse(filename, src, s.opts.ParseTimeout)
+		if !ok {
+			return nil, routePlain
+		}
+		defer bt.Release()
+		cands, via = s.candidates(bt, bt.RootNode(), ""), routeTree
+	}
 	cands = attachComments(cands)
 
+	var pieces []piece
 	for i, c := range cands {
 		start := c.row
 		if i == 0 {
@@ -142,49 +173,63 @@ func (s splitter) treePieces(filename string, src []byte) (pieces []piece, ok bo
 		}
 		pieces = append(pieces, piece{start: start, end: end, sig: c.sig, rank: c.rank})
 	}
-	return pieces, len(pieces) > 0
+	if len(pieces) == 0 {
+		return nil, routePlain
+	}
+	return pieces, via
 }
 
-// candidates lists where pieces may start inside node. Children too big to
-// be one piece are opened up, and the child's header row joins its first
-// inner piece so a method's signature stays with its first lines.
+// candidates lists where pieces may start inside node.
 func (s splitter) candidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node, enclosing string) []candidate {
 	var out []candidate
 	for _, c := range namedChildren(node) {
-		typ := bt.NodeType(c)
-		start, end := int(c.StartPoint().Row), int(c.EndPoint().Row)
-		if end >= len(s.lines) {
-			end = len(s.lines) - 1
-		}
-		k := kind(typ, enclosing != "")
-		sig := enclosing
-		if k == rankDef || enclosing == "" {
-			sig = s.signature(start, end)
-		}
-		if k != rankDef && enclosing != "" {
-			k = rankOther
-		}
-		if s.tooBig(start, end) && slices.ContainsFunc(c.Children(), (*gotreesitter.Node).IsNamed) {
-			// Non-definitions on the header row (names, parameters) are
-			// part of the header, which joins the first body candidate.
-			var body []candidate
-			for _, ic := range s.candidates(bt, c, sig) {
-				if ic.row > start || ic.rank == rankDef {
-					body = append(body, ic)
-				}
-			}
-			if len(body) > 0 {
-				body[0].row = start
-				if k == rankDef {
-					body[0].sig, body[0].rank = sig, k
-				}
-				out = append(out, body...)
-				continue
-			}
-		}
-		out = append(out, candidate{row: start, sig: sig, rank: k, comment: strings.Contains(typ, "comment")})
+		out = append(out, s.nodeCandidates(bt, c, enclosing)...)
 	}
 	return firstPerRow(out)
+}
+
+// nodeCandidates lists where pieces may start in node. A node too big to be
+// one piece is opened up, and its header row joins its first inner piece so
+// a method's signature stays with its first lines.
+func (s splitter) nodeCandidates(bt *gotreesitter.BoundTree, node *gotreesitter.Node, enclosing string) []candidate {
+	typ := bt.NodeType(node)
+	start, end := int(node.StartPoint().Row), int(node.EndPoint().Row)
+	if end >= len(s.lines) {
+		end = len(s.lines) - 1
+	}
+	c := s.leaf(typ, start, end, enclosing)
+	if s.tooBig(start, end) && slices.ContainsFunc(node.Children(), (*gotreesitter.Node).IsNamed) {
+		// Non-definitions on the header row (names, parameters) are part
+		// of the header, which joins the first body candidate.
+		var body []candidate
+		for _, ic := range s.candidates(bt, node, c.sig) {
+			if ic.row > start || ic.rank == rankDef {
+				body = append(body, ic)
+			}
+		}
+		if len(body) > 0 {
+			body[0].row = start
+			if c.rank == rankDef {
+				body[0].sig, body[0].rank = c.sig, c.rank
+			}
+			return body
+		}
+	}
+	return []candidate{c}
+}
+
+// leaf is the candidate for a node of type typ on rows start..end that
+// isn't opened up. Top-level nodes of any kind name their piece; a nested
+// one keeps the enclosing name unless it's a definition.
+func (s splitter) leaf(typ string, start, end int, enclosing string) candidate {
+	c := candidate{row: start, sig: enclosing, rank: kind(typ, enclosing != ""), comment: strings.Contains(typ, "comment")}
+	if c.rank == rankDef || enclosing == "" {
+		c.sig = s.signature(start, end)
+	}
+	if c.rank != rankDef && enclosing != "" {
+		c.rank = rankOther
+	}
+	return c
 }
 
 // namedChildren lists node's named children. NamedChild(i) and
@@ -214,15 +259,27 @@ func firstPerRow(cands []candidate) []candidate {
 }
 
 // attachComments moves each run of comments onto the piece that follows it,
-// so doc comments stay with what they document.
+// so doc comments stay with what they document. A run with nothing after it
+// stays as it is.
 func attachComments(cands []candidate) []candidate {
-	for i := len(cands) - 2; i >= 0; i-- {
-		if cands[i].comment && !cands[i+1].comment {
-			cands[i+1].row = cands[i].row
-			cands = append(cands[:i], cands[i+1:]...)
+	out := cands[:0]
+	run := -1 // index in out of the current run's first comment
+	for _, c := range cands {
+		if c.comment {
+			if run < 0 {
+				run = len(out)
+			}
+			out = append(out, c)
+			continue
 		}
+		if run >= 0 {
+			c.row = out[run].row
+			out = out[:run]
+			run = -1
+		}
+		out = append(out, c)
 	}
-	return cands
+	return out
 }
 
 // Node type words that mark a definition. Top-level declarations of any
@@ -262,11 +319,11 @@ func (s splitter) fallbackPieces() []piece {
 	var pieces []piece
 	start := 0
 	for r := 1; r < len(s.lines); r++ {
-		line, prev := s.lines[r], strings.TrimSpace(s.lines[r-1])
+		line := s.lines[r]
 		if strings.TrimSpace(line) == "" || indented(line) || closer(line) {
 			continue
 		}
-		if prev == "" || (!indented(s.lines[r-1]) && closer(prev)) {
+		if prev := strings.TrimSpace(s.lines[r-1]); prev == "" || (!indented(s.lines[r-1]) && closer(prev)) {
 			pieces = append(pieces, piece{start: start, end: r - 1, sig: s.signature(start, r-1), rank: rankOther})
 			start = r
 		}
@@ -366,6 +423,12 @@ func (s splitter) segments(p piece, row int) []piece {
 		hi := min(lo+s.opts.MaxBytes, len(line))
 		for hi < len(line) && hi > lo && !utf8.RuneStart(line[hi]) {
 			hi--
+		}
+		if hi <= lo {
+			// MaxBytes is smaller than this rune: take the whole rune
+			// rather than loop forever on an empty segment.
+			_, n := utf8.DecodeRuneInString(line[lo:])
+			hi = lo + n
 		}
 		out = append(out, piece{start: row, end: row, lo: lo, hi: hi, sig: p.sig, rank: p.rank})
 		lo = hi

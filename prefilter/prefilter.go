@@ -3,36 +3,97 @@
 package prefilter
 
 import (
+	"bytes"
 	"errors"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
+	"unicode/utf8"
 )
 
-type Filter struct{ re *regexp.Regexp }
+type Filter struct {
+	re *regexp.Regexp
+	// words are the keywords, case-folded by fold, when the regex is built
+	// from them. Keep searches for them directly: it matches exactly what
+	// the regex would, many times faster.
+	words [][]byte
+}
 
 // New uses pattern as the keyword regex, or builds one from the questions'
 // words when pattern is empty.
 func New(pattern string, questions []string) (*Filter, error) {
+	var words [][]byte
 	if pattern == "" {
-		words := Keywords(questions)
-		if len(words) == 0 {
+		kws := Keywords(questions)
+		if len(kws) == 0 {
 			return nil, errors.New("no keywords left in the question after dropping common words; pass keywords")
 		}
-		for i, w := range words {
-			words[i] = regexp.QuoteMeta(w)
+		quoted := make([]string, len(kws))
+		for i, w := range kws {
+			quoted[i] = regexp.QuoteMeta(w)
+			words = append(words, fold(nil, w))
 		}
-		pattern = strings.Join(words, "|")
+		pattern = strings.Join(quoted, "|")
 	}
 	re, err := regexp.Compile("(?i)" + pattern)
 	if err != nil {
 		return nil, err
 	}
-	return &Filter{re: re}, nil
+	return &Filter{re: re, words: words}, nil
 }
 
 // Keep reports whether any keyword appears in code.
-func (f *Filter) Keep(code string) bool { return f.re.MatchString(code) }
+func (f *Filter) Keep(code string) bool {
+	if f.words == nil {
+		return f.re.MatchString(code)
+	}
+	buf := bufs.Get().(*[]byte)
+	defer bufs.Put(buf)
+	*buf = fold((*buf)[:0], code)
+	for _, w := range f.words {
+		if bytes.Contains(*buf, w) {
+			return true
+		}
+	}
+	return false
+}
+
+var bufs = sync.Pool{New: func() any { return new([]byte) }}
+
+// fold appends s to dst with every rune replaced by the smallest rune it
+// case-folds to, and invalid UTF-8 by U+FFFD, as the regex reads it. Two
+// runes match under (?i) exactly when they fold to the same rune, so a
+// keyword matches under (?i) exactly when its folded bytes appear in the
+// folded code.
+func fold(dst []byte, s string) []byte {
+	for i := 0; i < len(s); {
+		if s[i] < utf8.RuneSelf {
+			// Copy the run of ASCII, then upper-case it in place.
+			j := i + 1
+			for j < len(s) && s[j] < utf8.RuneSelf {
+				j++
+			}
+			n := len(dst)
+			dst = append(dst, s[i:j]...)
+			for k, c := range dst[n:] {
+				if 'a' <= c && c <= 'z' {
+					dst[n+k] = c - ('a' - 'A')
+				}
+			}
+			i = j
+			continue
+		}
+		r, n := utf8.DecodeRuneInString(s[i:])
+		i += n
+		least := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			least = min(least, f)
+		}
+		dst = utf8.AppendRune(dst, least)
+	}
+	return dst
+}
 
 // Pattern is the regex in use, for messages.
 func (f *Filter) Pattern() string { return strings.TrimPrefix(f.re.String(), "(?i)") }

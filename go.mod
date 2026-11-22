@@ -3,7 +3,7 @@ module github.com/K1erans/jinter
 go 1.26.5
 
 require (
-	github.com/odvcencio/gotreesitter v0.55.1
+	github.com/odvcencio/gotreesitter v0.58.0
 	golang.org/x/time v0.16.0
 	modernc.org/sqlite v1.60.1
 )

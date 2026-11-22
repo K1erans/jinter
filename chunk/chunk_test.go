@@ -251,23 +251,107 @@ func TestImportsNeverMakeAChunkOfTheirOwn(t *testing.T) {
 }
 
 func TestAParseThatRunsOutOfTimeFallsBack(t *testing.T) {
+	// Python, as Go files only reach tree-sitter for big declarations.
 	var b strings.Builder
-	b.WriteString("package big\n\n")
+	b.WriteString("import os\n\n")
 	for i := 0; i < 400; i++ {
-		fmt.Fprintf(&b, "func F%d(a int) int {\n\tif a > %d {\n\t\treturn a\n\t}\n\treturn %d\n}\n\n", i, i, i)
+		fmt.Fprintf(&b, "def f%d(a):\n    if a > %d:\n        return a\n    return %d\n\n", i, i, i)
 	}
 	src := []byte(b.String())
 	opts := Options{MinLines: 1, MaxLines: 300, MaxBytes: 1 << 20}
-	// Only the parser knows "package big" is a package line, so only the
-	// parser merges it into the first function.
+	// Only the parser knows "import os" is an import, so only the parser
+	// merges it into the first function.
 	fallback := Split("big.unknownext", src, opts)[0]
-	if parsed := Split("big.go", src, opts)[0]; parsed.End == fallback.End {
+	if parsed := Split("big.py", src, opts)[0]; parsed.End == fallback.End {
 		t.Fatal("test needs a file the parser and the fallback split differently")
 	}
 	opts.ParseTimeout = time.Nanosecond
-	got := Split("big.go", src, opts)
+	got := Split("big.py", src, opts)
 	if got[0] != fallback {
 		t.Fatalf("a timed-out parse should use the plain splitter: first chunk %v, want %v", spans(got[:1]), spans([]Chunk{fallback}))
 	}
 	assertCovers(t, string(src), got, opts)
+}
+
+func TestByteLimitBelowOneRuneStillCutsTheLine(t *testing.T) {
+	// Each rune is 3 bytes, more than MaxBytes: every segment has to hold
+	// one whole rune, or the cut would never move forward.
+	src := "x = '" + strings.Repeat("日", 20) + "'\n"
+	for _, maxBytes := range []int{0, 1, 2} {
+		opts := Options{MinLines: 1, MaxLines: 300, MaxBytes: maxBytes}
+		got := Split("notes.unknownext", []byte(src), opts)
+		var joined strings.Builder
+		for _, c := range got {
+			if c.Start != 1 || c.End != 1 || c.Code == "" || len(c.Code) > max(maxBytes, len("日")) {
+				t.Fatalf("MaxBytes %d: bad segment %d-%d %q", maxBytes, c.Start, c.End, c.Code)
+			}
+			if src[c.Offset:c.Offset+len(c.Code)] != c.Code {
+				t.Fatalf("MaxBytes %d: segment %q is not the source at offset %d", maxBytes, c.Code, c.Offset)
+			}
+			joined.WriteString(c.Code)
+		}
+		if joined.String()+"\n" != src {
+			t.Fatalf("MaxBytes %d: segments join to %q", maxBytes, joined.String())
+		}
+	}
+}
+
+func TestRowBytesIsTheJoinedLength(t *testing.T) {
+	src := "package p\n\nfunc é() {}\n\t\n// end"
+	lines := strings.Split(src, "\n")
+	s := splitter{text: src, lines: lines, starts: make([]int, len(lines))}
+	for r := 1; r < len(lines); r++ {
+		s.starts[r] = s.starts[r-1] + len(lines[r-1]) + 1
+	}
+	for start := range lines {
+		for end := start; end < len(lines); end++ {
+			if got, want := s.rowBytes(start, end), len(strings.Join(lines[start:end+1], "\n")); got != want {
+				t.Errorf("rowBytes(%d, %d) = %d, want %d", start, end, got, want)
+			}
+		}
+	}
+	if got := s.rowBytes(len(lines), len(lines)-1); got != 0 {
+		t.Errorf("an empty range has %d bytes", got)
+	}
+}
+
+func TestCommentRunsJoinWhatFollowsThem(t *testing.T) {
+	c := func(row int) candidate { return candidate{row: row, comment: true} }
+	d := func(row int) candidate { return candidate{row: row, sig: fmt.Sprint("def", row), rank: rankDef} }
+	got := attachComments([]candidate{d(0), c(2), c(3), d(4), d(8), c(10), d(11), c(15), c(16)})
+	want := []candidate{d(0), d(4), d(8), d(11), c(15), c(16)}
+	want[1].row, want[3].row = 2, 10
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got  %v\nwant %v", got, want)
+	}
+}
+
+func TestSplitIsSafeForConcurrentUse(t *testing.T) {
+	srcs := map[string]string{
+		"retry.go": goSrc,
+		// Over Default.MaxLines, so tree-sitter opens it up.
+		"long.go": "package p\n\nfunc Long() {\n" + strings.Repeat("\tx := 1\n\t_ = x\n", 200) + "}\n",
+		"pay.py":  "def pay():\n    return 1\n\n\ndef refund():\n    return 2\n",
+	}
+	want := map[string][]Chunk{}
+	for name, src := range srcs {
+		want[name] = Split(name, []byte(src), Default)
+	}
+	done := make(chan error)
+	for i := range 8 {
+		go func() {
+			for name, src := range srcs {
+				if got := Split(name, []byte(src), Default); fmt.Sprint(got) != fmt.Sprint(want[name]) {
+					done <- fmt.Errorf("goroutine %d: %s split differently", i, name)
+					return
+				}
+			}
+			done <- nil
+		}()
+	}
+	for range 8 {
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}
 }

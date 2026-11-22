@@ -1,10 +1,12 @@
 package search
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -130,5 +132,46 @@ func TestLayoutsFromATimedOutParseAreSaved(t *testing.T) {
 	again, _ := Load(fs, lo)
 	if !reflect.DeepEqual(again, got) || store.written != 2 {
 		t.Fatalf("a repeat load should reuse the saved split, saved %d more", store.written-2)
+	}
+}
+
+func TestChunksKeepFileOrderWhateverTheirSize(t *testing.T) {
+	fs := files(t)
+	fs[0], fs[1] = fs[1], fs[0] // the small file first; the big one is split first
+	got, err := Load(fs, LoadOptions{Chunk: small()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, c := range got {
+		paths = append(paths, filepath.Base(c.Path))
+	}
+	if want := []string{"send.go", "retry.go", "retry.go"}; !slices.Equal(paths, want) {
+		t.Fatalf("got %q, want %q", paths, want)
+	}
+}
+
+func TestACancelledLoadStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LoadContext(ctx, files(t), LoadOptions{Chunk: small()}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestDamagedLayoutsAreSplitAgain(t *testing.T) {
+	src := []byte("package p\n")
+	for _, b := range []string{
+		`not json`,
+		`[{"o":-1,"n":1}]`,
+		`[{"o":5,"n":20}]`,
+		`[{"o":9223372036854775807,"n":1}]`, // offset + length overflows
+	} {
+		if _, ok := decodeLayout([]byte(b), src); ok {
+			t.Errorf("%s: accepted", b)
+		}
+	}
+	if cs, ok := decodeLayout([]byte(`[{"s":1,"e":1,"o":0,"n":9,"g":"p"}]`), src); !ok || cs[0].Code != "package p" {
+		t.Fatalf("a good layout: %+v, %v", cs, ok)
 	}
 }

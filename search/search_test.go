@@ -1,12 +1,21 @@
 package search
 
 import (
+	"bytes"
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/K1erans/jinter/cache"
 	"github.com/K1erans/jinter/chunk"
@@ -202,6 +211,8 @@ func TestChunksOfAFileShareARequestButAreCachedOneByOne(t *testing.T) {
 		t.Fatal(err)
 	}
 	reqs := fake.Requests()
+	// Calls run in parallel, so they may arrive in either order.
+	slices.SortFunc(reqs, func(a, b jev.Request) int { return strings.Compare(b.Path, a.Path) })
 	if len(reqs) != 2 || reqs[0].Path != "app/src/pay.ts" || len(reqs[0].Chunks) != 3 || reqs[0].Chunks[1].Code != "refund" || len(reqs[1].Chunks) != 1 {
 		t.Fatalf("want the three pay.ts chunks in one request and http.ts in another, got %+v", reqs)
 	}
@@ -289,5 +300,193 @@ func TestNarrowingByAQuestionNeverAskedIsAnError(t *testing.T) {
 	Run(context.Background(), chunks(), &jevtest.Fake{Score: scores(paymentScores)}, store, opts("retries failed payments"))
 	if _, err := Narrow(chunks(), store, "jev-1.13.0", "sends email", 2); !errors.Is(err, ErrNotAsked) {
 		t.Fatalf("got %v, want ErrNotAsked", err)
+	}
+}
+
+func TestStateEncodingMatchesMarshal(t *testing.T) {
+	// Cache keys hash this encoding, so it must never drift from
+	// json.Marshal, including its escaping of HTML, U+2028 and bad UTF-8.
+	s := new(stateEncoder)
+	s.enc = json.NewEncoder(&s.buf)
+	for _, code := range []string{
+		"if a < b && c > d { return \"x\" }\n\ttab",
+		"line sep para",
+		"bad \xff utf-8",
+		"",
+		"short",
+	} {
+		ch := Chunk{Rel: "app/<x>.go", Chunk: chunk.Chunk{Code: code}}
+		want, err := json.Marshal(jev.State{Path: ch.Rel, Code: code})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.encode(ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("encode(%q) = %s, want %s", code, got, want)
+		}
+	}
+}
+
+func TestNegativeWorkersUseTheDefault(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	o := opts("retries failed payments")
+	o.Workers = -1
+	if _, err := Run(ctx, chunks(), &jevtest.Fake{Score: scores(paymentScores)}, cache.NewMemory(), o); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// failingPuts is a store whose answer writes all fail.
+type failingPuts struct{ *cache.Memory }
+
+func (failingPuts) PutAnswers([]cache.Answer) error { return errors.New("disk full") }
+
+// batchRecorder is a store that records each PutAnswers call, and fails
+// them all when fail is set.
+type batchRecorder struct {
+	*cache.Memory
+	fail    bool
+	mu      sync.Mutex
+	batches [][]cache.Answer
+}
+
+func (s *batchRecorder) PutAnswers(answers []cache.Answer) error {
+	s.mu.Lock()
+	s.batches = append(s.batches, slices.Clone(answers))
+	s.mu.Unlock()
+	if s.fail {
+		return errors.New("disk full")
+	}
+	return s.Memory.PutAnswers(answers)
+}
+
+func TestEachCallsAnswersAreSavedInOneWrite(t *testing.T) {
+	// pay.ts's chunks share one call; the second and fourth have the same
+	// code, so they share keys, and the write repeats them.
+	cs := fileChunks()
+	cs = slices.Insert(cs, 3, cs[1])
+	cs[3].Start, cs[3].End = 31, 40
+	qs := []string{"retries failed payments", "sends email"}
+	store := &batchRecorder{Memory: cache.NewMemory()}
+	fake := &jevtest.Fake{Score: jevtest.Contains(map[string]string{"retries failed payments": "retry"})}
+	if _, err := Run(context.Background(), cs, fake, store, opts(qs...)); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.batches) != len(fake.Requests()) || len(store.batches) != 2 {
+		t.Fatalf("want one write per Jev call (2), got %d writes for %d calls", len(store.batches), len(fake.Requests()))
+	}
+	slices.SortFunc(store.batches, func(a, b []cache.Answer) int { return len(b) - len(a) })
+	if n := len(store.batches[0]); n != 4*len(qs) {
+		t.Fatalf("pay.ts's write holds %d answers, want %d", n, 4*len(qs))
+	}
+	if n := len(store.batches[1]); n != len(qs) {
+		t.Fatalf("http.ts's write holds %d answers, want %d", n, len(qs))
+	}
+	for _, b := range store.batches {
+		for _, a := range b {
+			if got, _ := store.Get([]cache.Key{a.Key}); got[a.Key] != a.Noul {
+				t.Fatalf("cache holds %v for a key written as %v", got[a.Key], a.Noul)
+			}
+		}
+	}
+
+	// A failed write is reported once for the call, not once per answer.
+	var errs []error
+	o := opts(qs...)
+	o.OnCacheError = func(err error) { errs = append(errs, err) }
+	failing := &batchRecorder{Memory: cache.NewMemory(), fail: true}
+	if _, err := Run(context.Background(), cs, &jevtest.Fake{Score: fake.Score}, failing, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) != 2 {
+		t.Fatalf("want one error per failed write (2), got %d", len(errs))
+	}
+}
+
+func TestOnCacheErrorIsNeverCalledConcurrently(t *testing.T) {
+	var cs []Chunk
+	for i := range 64 {
+		p := fmt.Sprintf("src/f%d.ts", i)
+		cs = append(cs, Chunk{Path: p, Rel: "app/" + p, Chunk: chunk.Chunk{Start: 1, End: 2, Code: p}})
+	}
+	var inside atomic.Int32
+	var errs []error // appended without a lock: -race catches concurrent calls
+	o := opts("retries failed payments")
+	o.OnCacheError = func(err error) {
+		if inside.Add(1) > 1 {
+			t.Error("OnCacheError called concurrently")
+		}
+		time.Sleep(time.Millisecond)
+		errs = append(errs, err)
+		inside.Add(-1)
+	}
+	if _, err := Run(context.Background(), cs, &jevtest.Fake{Score: scores(paymentScores)}, failingPuts{cache.NewMemory()}, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) != len(cs) {
+		t.Fatalf("want one error per failed write, got %d", len(errs))
+	}
+}
+
+func TestACancelledRunAsksNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fake := &jevtest.Fake{Score: scores(paymentScores)}
+	if _, err := Run(ctx, chunks(), fake, cache.NewMemory(), opts("retries failed payments")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if n := len(fake.Requests()); n != 0 {
+		t.Fatalf("made %d calls", n)
+	}
+}
+
+func TestTopPicksTheSameMatchesAsSortingThemAll(t *testing.T) {
+	// Few distinct scores and repeated paths, so most of the order comes
+	// from the tie-breaks.
+	r := rand.New(rand.NewPCG(7, 8))
+	var cs []Chunk
+	var s [][]float64
+	for i := range 500 {
+		p := fmt.Sprintf("src/f%d.go", r.IntN(20))
+		cs = append(cs, Chunk{Path: p, Rel: p, Chunk: chunk.Chunk{Start: r.IntN(30), Signature: strconv.Itoa(i)}})
+		s = append(s, []float64{float64(r.IntN(5)) / 4})
+	}
+	all := rank("q", cs, s, 0, Options{Threshold: 0.25})
+	if !slices.IsSortedFunc(all.Matches, func(a, b Match) int {
+		return cmp.Or(cmp.Compare(b.Probability, a.Probability), cmp.Compare(a.Path, b.Path), cmp.Compare(a.Start, b.Start))
+	}) {
+		t.Fatal("matches are not best first")
+	}
+	if *all.Best != all.Matches[0] {
+		t.Fatalf("best %+v, first match %+v", *all.Best, all.Matches[0])
+	}
+	for _, top := range []int{1, 2, 7, 100, len(all.Matches), len(all.Matches) + 1} {
+		got := rank("q", cs, s, 0, Options{Threshold: 0.25, Top: top})
+		if want := all.Matches[:min(top, len(all.Matches))]; !reflect.DeepEqual(got.Matches, want) {
+			t.Fatalf("top %d: got %+v\nwant %+v", top, got.Matches, want)
+		}
+	}
+}
+
+func TestNarrowBreaksTiesByFileOrder(t *testing.T) {
+	store := cache.NewMemory()
+	same := func(jev.State, string) float64 { return 0.5 }
+	cs := fileChunks()
+	if _, err := Run(context.Background(), cs, &jevtest.Fake{Score: same}, store, opts("q")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Narrow(cs, store, "jev-1.13.0", "q", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, cs[:2]) {
+		t.Fatalf("got %+v", got)
+	}
+	if got, err := Narrow(cs, store, "jev-1.13.0", "q", 0); err != nil || len(got) != 0 {
+		t.Fatalf("n = 0: %+v, %v", got, err)
 	}
 }

@@ -2,12 +2,14 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS meta (
 type SQLite struct {
 	db    *sql.DB
 	model string
+	put   *sql.Stmt // PutAnswers' INSERT, prepared once: it runs once per Jev call
 }
 
 // Dir is the folder holding cache databases: $JINTER_CACHE_DIR, or jinter
@@ -92,7 +95,7 @@ func Open(path, model string) (*SQLite, error) {
 		return nil, err
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate",
-		path, busyTimeoutMS)
+		uriPath.Replace(path), busyTimeoutMS)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -118,10 +121,22 @@ func Open(path, model string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("cleaning cache %s: %w", path, err)
 	}
+	if c.put, err = db.Prepare(`INSERT OR IGNORE INTO answers (key, noul, model, last_used) VALUES (?, ?, ?, ?)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("opening cache %s: %w", path, err)
+	}
 	return c, nil
 }
 
-func (c *SQLite) Close() error { return c.db.Close() }
+// uriPath escapes the characters SQLite's URI filenames give a meaning to,
+// so a path holding them names the file it says: unescaped, "?" or "#"
+// would cut the path short (and drop the pragmas after it) and "%" would
+// be decoded.
+var uriPath = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
+
+func (c *SQLite) Close() error {
+	return errors.Join(c.put.Close(), c.db.Close())
+}
 
 func isBusy(err error) bool {
 	var se interface{ Code() int }
@@ -184,67 +199,152 @@ func (c *SQLite) GetChunks(keys []Key) (map[Key][]byte, error) {
 	return lookup[[]byte](c, "chunks", "layout", keys)
 }
 
-// lookup reads column for keys from table in batches, refreshing last_used
-// on rows that haven't been touched for a day. Keys are looked up in order,
-// so each batch reads one narrow run of the index instead of pages from
-// all over it.
+// lookup reads column for keys from table, then refreshes last_used on
+// the rows found that haven't been touched for a day. Keys are looked up
+// in order, and once each, so each batch reads one narrow run of the index
+// instead of pages from all over it.
+//
+// The reads share one read transaction, which takes no write lock, and
+// the refresh is one write transaction afterwards: the cache has a single
+// connection, so the two can't overlap.
 func lookup[V any](c *SQLite, table, column string, keys []Key) (map[Key]V, error) {
-	out := make(map[Key]V, len(keys))
-	t := now().Unix()
+	if len(keys) == 0 {
+		return map[Key]V{}, nil
+	}
 	keys = slices.Clone(keys)
-	slices.SortFunc(keys, func(a, b Key) int { return bytes.Compare(a[:], b[:]) })
-	for len(keys) > 0 {
-		batch := keys[:min(lookupBatch, len(keys))]
-		keys = keys[len(batch):]
-		args := make([]any, len(batch))
-		for i, k := range batch {
-			args[i] = k[:]
-		}
-		in := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
-		rows, err := c.db.Query(`SELECT key, `+column+`, last_used FROM `+table+` WHERE key IN (`+in+`)`, args...)
+	slices.SortFunc(keys, compareKeys)
+	keys = slices.Compact(keys)
+	t := now().Unix()
+
+	tx, err := c.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	out := make(map[Key]V, len(keys))
+	var stale []Key
+	query := func(n int) string {
+		return `SELECT key, ` + column + `, last_used < ? FROM ` + table + ` WHERE key IN (` + params(n) + `)`
+	}
+	err = inBatches(tx, keys, t-int64(touchAfter/time.Second), query, func(stmt *sql.Stmt, args []any) error {
+		rows, err := stmt.Query(args...)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		var stale []any
+		defer rows.Close()
 		for rows.Next() {
-			var raw []byte
+			var raw sql.RawBytes // only valid until Next; copied into k
 			var v V
-			var lastUsed int64
-			if err := rows.Scan(&raw, &v, &lastUsed); err != nil {
-				rows.Close()
-				return nil, err
+			var old bool
+			if err := rows.Scan(&raw, &v, &old); err != nil {
+				return err
 			}
 			var k Key
 			copy(k[:], raw)
 			out[k] = v
-			if t-lastUsed > int64(touchAfter/time.Second) {
-				stale = append(stale, raw)
+			if old {
+				stale = append(stale, k)
 			}
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	tx.Rollback() // release the connection for the refresh
+	if len(stale) > 0 {
+		if err := c.touch(table, stale, t); err != nil {
 			return nil, err
-		}
-		if len(stale) > 0 {
-			in := strings.TrimSuffix(strings.Repeat("?,", len(stale)), ",")
-			if _, err := c.db.Exec(`UPDATE `+table+` SET last_used = ? WHERE key IN (`+in+`)`, append([]any{t}, stale...)...); err != nil {
-				return nil, err
-			}
 		}
 	}
 	return out, nil
 }
 
-// Put saves one answer. An existing answer for the key is kept: the key
-// already pins the exact model, question and code.
-func (c *SQLite) Put(key Key, noul float64) error {
-	_, err := c.db.Exec(`INSERT OR IGNORE INTO answers (key, noul, model, last_used) VALUES (?, ?, ?, ?)`,
-		key[:], noul, c.model, now().Unix())
-	return err
+// touch sets last_used to t on table's rows for keys, in one transaction.
+func (c *SQLite) touch(table string, keys []Key, t int64) error {
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	query := func(n int) string { return `UPDATE ` + table + ` SET last_used = ? WHERE key IN (` + params(n) + `)` }
+	err = inBatches(tx, keys, t, query, func(stmt *sql.Stmt, args []any) error {
+		_, err := stmt.Exec(args...)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// inBatches calls fn for keys lookupBatch at a time, with the statement
+// query(n) for a batch of n keys and arguments first, then the batch's
+// keys. Every batch but the last is full, so at most two statements are
+// prepared; they close with tx.
+func inBatches(tx *sql.Tx, keys []Key, first any, query func(n int) string, fn func(*sql.Stmt, []any) error) error {
+	var stmt *sql.Stmt
+	prepared := 0 // batch size stmt was prepared for
+	args := make([]any, 0, 1+min(lookupBatch, len(keys)))
+	for batch := range slices.Chunk(keys, lookupBatch) {
+		if len(batch) != prepared {
+			var err error
+			if stmt, err = tx.Prepare(query(len(batch))); err != nil {
+				return err
+			}
+			prepared = len(batch)
+		}
+		args = append(args[:0], first)
+		for i := range batch {
+			args = append(args, batch[i][:])
+		}
+		if err := fn(stmt, args); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func compareKeys(a, b Key) int { return bytes.Compare(a[:], b[:]) }
+
+// params is n comma-separated placeholders.
+func params(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// PutAnswers saves answers in one transaction, which a search's workers
+// take turns at: one per Jev call rather than one per answer. An existing
+// answer for a key is kept, and so is its last_used: the key already pins
+// the exact model, question and code. A key repeated within answers is
+// likewise written once.
+//
+// Each new key most likely lands on a page of its own, and every page a
+// transaction changes is written out when it commits, so saving many
+// answers at once costs less per answer only until the table is large.
+func (c *SQLite) PutAnswers(answers []Answer) error {
+	if len(answers) == 0 {
+		return nil
+	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// The cache has one connection, on which c.put is already prepared,
+	// so this reuses it rather than preparing it again.
+	stmt := tx.Stmt(c.put)
+	t := now().Unix()
+	for _, a := range answers {
+		if _, err := stmt.Exec(a.Key[:], a.Noul, c.model, t); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // PutChunks saves chunk layouts in one transaction. As with answers, an
-// existing layout for a key is kept.
+// existing layout for a key is kept. Layouts are inserted in key order,
+// which fills the table's pages one after another instead of at random.
 func (c *SQLite) PutChunks(layouts map[Key][]byte) error {
 	if len(layouts) == 0 {
 		return nil
@@ -260,8 +360,9 @@ func (c *SQLite) PutChunks(layouts map[Key][]byte) error {
 	}
 	defer stmt.Close()
 	t := now().Unix()
-	for k, layout := range layouts {
-		if _, err := stmt.Exec(k[:], layout, t); err != nil {
+	keys := slices.SortedFunc(maps.Keys(layouts), compareKeys)
+	for _, k := range keys {
+		if _, err := stmt.Exec(k[:], layouts[k], t); err != nil {
 			return err
 		}
 	}

@@ -2,6 +2,7 @@
 package search
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -40,9 +41,11 @@ type Options struct {
 	Threshold float64 // minimum probability to count as a match
 	Top       int     // maximum matches per question; 0 means no limit
 	ReadCache bool    // false still writes answers, but never reads them
-	Workers   int     // concurrent Jev calls; 0 means DefaultWorkers
+	Workers   int     // concurrent Jev calls; 0 or less means DefaultWorkers
 
-	// OnCacheError hears about failed cache writes, which don't stop a search.
+	// OnCacheError hears about failed cache writes, which don't stop a
+	// search: once for each Jev call whose answers couldn't be saved.
+	// Calls never overlap.
 	OnCacheError func(error)
 
 	// OnAsk hears how many chunks are about to be sent to Jev, when any are.
@@ -69,8 +72,8 @@ type task struct {
 }
 
 // Run asks every question about every chunk, using cached answers where it
-// can, and ranks the results. Each answer is cached as it arrives, so an
-// interrupted run keeps its progress.
+// can, and ranks the results. Answers are cached as they arrive, each Jev
+// call's in one write, so an interrupted run keeps its progress.
 func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cache, opts Options) ([]Result, error) {
 	questions := dedupe(opts.Questions)
 	instructions := make([]string, len(questions))
@@ -78,7 +81,7 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 		instructions[i] = jev.Instruction(q)
 	}
 
-	all, err := keyAll(chunks, opts.Model, instructions)
+	all, err := keyAll(ctx, chunks, opts.Model, instructions)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +117,17 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 		}
 	}
 
+	// Answers arrive on many workers at once; callers needn't make
+	// OnCacheError safe for concurrent use.
+	var cacheErrMu sync.Mutex
+	cacheError := func(err error) {
+		if opts.OnCacheError != nil {
+			cacheErrMu.Lock()
+			defer cacheErrMu.Unlock()
+			opts.OnCacheError(err)
+		}
+	}
+
 	// Each answer is cached under its own chunk's key, as if the chunk had
 	// been sent alone, so editing one function re-asks only that function
 	// and a chunk's answers don't depend on which others shared its call.
@@ -134,24 +148,39 @@ func Run(ctx context.Context, chunks []Chunk, client jev.Client, store cache.Cac
 		if len(resp.Nouls) != len(pack) {
 			return fmt.Errorf("%s:%d-%d: got answers for %d chunks, asked about %d", first.Path, first.Start, last.End, len(resp.Nouls), len(pack))
 		}
+		// The call's answers are saved as soon as it returns, in one write,
+		// so with SQLite they share one transaction.
+		answers := make([]cache.Answer, 0, len(pack)*len(questions))
+		save := func() {
+			if len(answers) == 0 {
+				return
+			}
+			if err := store.PutAnswers(answers); err != nil {
+				cacheError(err)
+			}
+		}
 		for i, t := range pack {
 			if len(resp.Nouls[i]) != len(t.missing) {
+				save() // the chunks before this one were answered properly
 				ch := chunks[t.chunk]
 				return fmt.Errorf("%s:%d-%d: got %d answers for %d questions", ch.Path, ch.Start, ch.End, len(resp.Nouls[i]), len(t.missing))
 			}
 			for j, q := range t.missing {
 				scores[t.chunk][q] = resp.Nouls[i][j]
-				if err := store.Put(keys[t.chunk][q], resp.Nouls[i][j]); err != nil && opts.OnCacheError != nil {
-					opts.OnCacheError(err)
-				}
+				answers = append(answers, cache.Answer{Key: keys[t.chunk][q], Noul: resp.Nouls[i][j]})
 			}
 		}
+		save()
 		return nil
 	}
 	if len(tasks) > 0 && opts.OnAsk != nil {
 		opts.OnAsk(len(tasks))
 	}
-	if err := parallel(ctx, packs(chunks, tasks), cmp.Or(opts.Workers, DefaultWorkers), ask); err != nil {
+	workers := opts.Workers
+	if workers <= 0 {
+		workers = DefaultWorkers
+	}
+	if err := parallel(ctx, packs(chunks, tasks), workers, ask); err != nil {
 		return nil, err
 	}
 
@@ -181,20 +210,40 @@ func packs(chunks []Chunk, tasks []task) [][]task {
 	return out
 }
 
-// stateOf encodes a chunk as Jev would be shown it alone, for its cache
-// keys.
-func stateOf(ch Chunk) ([]byte, error) {
-	return json.Marshal(jev.State{Path: ch.Rel, Code: ch.Code})
+// stateEncoder encodes chunks as Jev would be shown them alone, for their
+// cache keys. It reuses one buffer: a fresh one per chunk was most of what
+// a cached search allocated.
+type stateEncoder struct {
+	buf bytes.Buffer
+	enc *json.Encoder
+}
+
+var stateEncoders = sync.Pool{New: func() any {
+	s := new(stateEncoder)
+	s.enc = json.NewEncoder(&s.buf)
+	return s
+}}
+
+// encode returns exactly what json.Marshal would, valid until the next
+// call.
+func (s *stateEncoder) encode(ch Chunk) ([]byte, error) {
+	s.buf.Reset()
+	if err := s.enc.Encode(jev.State{Path: ch.Rel, Code: ch.Code}); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(s.buf.Bytes(), []byte("\n")), nil // Encode adds a newline
 }
 
 // keyAll builds every chunk's cache key for each instruction,
 // keys[c*len(instructions)+q], one worker per CPU: hashing every chunk once
 // per question is most of a cached search's time.
-func keyAll(chunks []Chunk, model string, instructions []string) ([]cache.Key, error) {
+func keyAll(ctx context.Context, chunks []Chunk, model string, instructions []string) ([]cache.Key, error) {
 	keys := make([]cache.Key, len(chunks)*len(instructions))
 	errs := make([]error, len(chunks))
-	each(len(chunks), func(c int) {
-		sent, err := stateOf(chunks[c])
+	if err := each(ctx, len(chunks), func(c int) {
+		s := stateEncoders.Get().(*stateEncoder)
+		defer stateEncoders.Put(s)
+		sent, err := s.encode(chunks[c])
 		if err != nil {
 			errs[c] = err
 			return
@@ -202,7 +251,9 @@ func keyAll(chunks []Chunk, model string, instructions []string) ([]cache.Key, e
 		for q, in := range instructions {
 			keys[c*len(instructions)+q] = cache.KeyOf(model, in, sent)
 		}
-	})
+	}); err != nil {
+		return nil, err
+	}
 	return keys, errors.Join(errs...)
 }
 
@@ -216,7 +267,7 @@ var ErrNotAsked = errors.New("no cached answers")
 // wording about only those ranked it as well as a full scan did. Chunks
 // with no cached answer are left out: the earlier search never saw them.
 func Narrow(chunks []Chunk, store cache.Cache, model, question string, n int) ([]Chunk, error) {
-	keys, err := keyAll(chunks, model, []string{jev.Instruction(question)})
+	keys, err := keyAll(context.Background(), chunks, model, []string{jev.Instruction(question)})
 	if err != nil {
 		return nil, err
 	}
@@ -225,16 +276,20 @@ func Narrow(chunks []Chunk, store cache.Cache, model, question string, n int) ([
 		return nil, fmt.Errorf("reading cache: %w", err)
 	}
 	var answered []int
+	score := make([]float64, len(chunks))
 	for i, k := range keys {
-		if _, ok := hits[k]; ok {
+		if v, ok := hits[k]; ok {
 			answered = append(answered, i)
+			score[i] = v
 		}
 	}
 	if len(answered) == 0 {
 		return nil, ErrNotAsked
 	}
-	slices.SortStableFunc(answered, func(a, b int) int { return cmp.Compare(hits[keys[b]], hits[keys[a]]) })
-	answered = answered[:min(n, len(answered))]
+	// Best first; equal scores keep file order.
+	answered = topK(answered, n, func(a, b int) int {
+		return cmp.Or(cmp.Compare(score[b], score[a]), cmp.Compare(a, b))
+	})
 	slices.Sort(answered)
 	kept := make([]Chunk, len(answered))
 	for j, i := range answered {
@@ -273,39 +328,98 @@ feed:
 	return context.Cause(ctx)
 }
 
-// rank sorts only the chunks at or above the threshold, usually a handful,
-// and finds the best of the rest in one pass.
+// rank finds the best chunk in one pass and sorts only the matches it
+// keeps: with Top set, it picks them out without sorting the rest, which
+// matters at the default threshold of 0, where every chunk matches.
 func rank(question string, chunks []Chunk, scores [][]float64, q int, opts Options) Result {
+	res := Result{Question: question}
+	if len(chunks) == 0 {
+		return res
+	}
 	match := func(c int) Match {
 		ch := chunks[c]
 		return Match{Path: ch.Path, Start: ch.Start, End: ch.End, Signature: ch.Signature, Probability: scores[c][q]}
 	}
-	better := func(a, b Match) int {
+	// better orders chunks best first. The chunk index breaks the last
+	// ties, so the order never depends on how the sort works.
+	better := func(a, b int) int {
 		return cmp.Or(
-			cmp.Compare(b.Probability, a.Probability),
-			cmp.Compare(a.Path, b.Path),
-			cmp.Compare(a.Start, b.Start),
+			cmp.Compare(scores[b][q], scores[a][q]),
+			cmp.Compare(chunks[a].Path, chunks[b].Path),
+			cmp.Compare(chunks[a].Start, chunks[b].Start),
+			cmp.Compare(a, b),
 		)
 	}
-	res := Result{Question: question}
-	best := -1
+	best := 0
+	var matched []int
 	for c := range chunks {
-		if best < 0 || better(match(c), match(best)) < 0 {
+		if better(c, best) < 0 {
 			best = c
 		}
 		if scores[c][q] >= opts.Threshold {
-			res.Matches = append(res.Matches, match(c))
+			matched = append(matched, c)
 		}
 	}
-	if best >= 0 {
-		m := match(best)
-		res.Best = &m
+	m := match(best)
+	res.Best = &m
+
+	k := len(matched)
+	if opts.Top > 0 {
+		k = min(k, opts.Top)
 	}
-	slices.SortStableFunc(res.Matches, better)
-	if opts.Top > 0 && len(res.Matches) > opts.Top {
-		res.Matches = res.Matches[:opts.Top]
+	if k > 0 {
+		res.Matches = make([]Match, k)
+		for i, c := range topK(matched, k, better) {
+			res.Matches[i] = match(c)
+		}
 	}
 	return res
+}
+
+// topK returns the k best of idx (all of them if k ≥ len(idx)), best
+// first by cmp, reusing idx's array. cmp must never return 0 for two
+// different indexes, or ties would come out in an arbitrary order.
+func topK(idx []int, k int, cmp func(a, b int) int) []int {
+	if k >= len(idx) {
+		slices.SortFunc(idx, cmp)
+		return idx
+	}
+	if k <= 0 {
+		return idx[:0]
+	}
+	// h is a heap of the k best seen so far, with the worst of them on top,
+	// so each later index only has to beat h[0].
+	h := idx[:k]
+	for i := k/2 - 1; i >= 0; i-- {
+		siftDown(h, i, cmp)
+	}
+	for _, x := range idx[k:] {
+		if cmp(x, h[0]) < 0 {
+			h[0] = x
+			siftDown(h, 0, cmp)
+		}
+	}
+	slices.SortFunc(h, cmp)
+	return h
+}
+
+// siftDown restores the heap below h[i], with the worst index by cmp at the
+// root.
+func siftDown(h []int, i int, cmp func(a, b int) int) {
+	for {
+		w := 2*i + 1
+		if w >= len(h) {
+			return
+		}
+		if r := w + 1; r < len(h) && cmp(h[r], h[w]) > 0 {
+			w = r
+		}
+		if cmp(h[w], h[i]) <= 0 {
+			return
+		}
+		h[i], h[w] = h[w], h[i]
+		i = w
+	}
 }
 
 // dedupe drops questions that differ only in case or white space.
