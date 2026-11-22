@@ -185,7 +185,7 @@ their own:
 |---|---|
 | [`walk`](walk) | File listing, `.gitignore`, binary, generated, test and doc detection |
 | [`chunk`](chunk) | Splitting files into function-sized chunks |
-| [`parse`](parse) | Syntax trees and highlight captures behind one interface, with the parser chosen per language (`$JINTER_PARSER`) |
+| [`parse`](parse) | Syntax trees and highlight captures behind one interface, with the parser chosen per language: gotreesitter by default, C tree-sitter with `-tags jinter_cgo` |
 | [`prefilter`](prefilter) | The keyword pre-pass |
 | [`jev`](jev) | Jev API client with an adaptive rate limiter and retries: `Ask` for search's Noul questions, `Decide` for any mix of Noul, Choice and Score questions about one state; `jevtest` fakes both |
 | [`cache`](cache) | SQLite and in-memory caches of answers and chunk layouts |
@@ -202,3 +202,14 @@ go build -tags 'grammar_subset grammar_subset_go grammar_subset_python grammar_s
 ```
 
 Files in other languages fall back to the plain splitter.
+
+## Parser backends
+
+Files are parsed with [gotreesitter](https://github.com/odvcencio/gotreesitter),
+in pure Go. Built with `-tags jinter_cgo` (cgo and a C compiler needed),
+jinter also has the C tree-sitter runtime with the official grammars for
+JavaScript, TypeScript, TSX, Go, Python, Rust, C, C++, Java, Ruby, JSON
+and HTML. Route languages to it with `$JINTER_PARSER` or
+`chunk.Options.Parsers`, e.g. `JINTER_PARSER='typescript=c,tsx=c'`, or
+`'*=c'` for every language it has; the rest stay on gotreesitter. A
+non-default routing gets its own cached chunk layouts.

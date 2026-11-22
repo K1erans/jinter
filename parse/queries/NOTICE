@@ -1,0 +1,16 @@
+These are the highlights.scm queries of the official tree-sitter grammars,
+copied unchanged at the versions go.mod pins. The C backend (parse/cts.go,
+jinter_cgo build tag) embeds them. Each is under its grammar's MIT license.
+
+javascript.scm  tree-sitter-javascript v0.23.1  queries/highlights.scm
+jsx.scm         tree-sitter-javascript v0.23.1  queries/highlights-jsx.scm
+typescript.scm  tree-sitter-typescript v0.23.2  queries/highlights.scm
+go.scm          tree-sitter-go v0.25.0          queries/highlights.scm
+python.scm      tree-sitter-python v0.25.0      queries/highlights.scm
+rust.scm        tree-sitter-rust v0.24.2        queries/highlights.scm
+c.scm           tree-sitter-c v0.24.2           queries/highlights.scm
+cpp.scm         tree-sitter-cpp v0.23.4         queries/highlights.scm
+java.scm        tree-sitter-java v0.23.5        queries/highlights.scm
+ruby.scm        tree-sitter-ruby v0.23.1        queries/highlights.scm
+json.scm        tree-sitter-json v0.24.8        queries/highlights.scm
+html.scm        tree-sitter-html v0.23.2        queries/highlights.scm
