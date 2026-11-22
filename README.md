@@ -163,9 +163,9 @@ their own:
 | Package | Does |
 |---|---|
 | [`walk`](walk) | File listing, `.gitignore`, binary, generated, test and doc detection |
-| [`chunk`](chunk) | Splitting files into function-sized chunks |
+| [`chunk`](chunk) | Splitting files into function-sized chunks; `Parse` returns a file's whole tree-sitter tree and grammar |
 | [`prefilter`](prefilter) | The keyword pre-pass |
-| [`jev`](jev) | Jev API client with an adaptive rate limiter and retries; `jevtest` fakes it |
+| [`jev`](jev) | Jev API client with an adaptive rate limiter and retries: `Ask` for search's Noul questions, `Decide` for any mix of Noul, Choice and Score questions about one state; `jevtest` fakes both |
 | [`cache`](cache) | SQLite and in-memory caches of answers and chunk layouts |
 | [`search`](search) | Chunking with cached layouts, then key → cache → Jev → rank |
 

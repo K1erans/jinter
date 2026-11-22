@@ -153,28 +153,71 @@ func (c *HTTP) Ask(ctx context.Context, req Request) (Response, error) {
 		return Response{}, c.badURL
 	}
 	payload, n := encodeRequest(req)
-	tokens := cost(payload)
+	var resp Response
+	err := c.do(ctx, payload, func(raw []byte) error {
+		model, nouls, err := decodeNouls(raw, n)
+		if err != nil {
+			return err
+		}
+		resp = Response{Model: model, Nouls: perChunk(req, nouls)}
+		return nil
+	})
+	if err != nil {
+		return Response{}, err
+	}
+	return resp, nil
+}
 
+// Decide asks q's questions, of any mix of kinds, about its state in one
+// call. It shares Ask's rate limiter, retries and backoff.
+func (c *HTTP) Decide(ctx context.Context, q Query) (Answers, error) {
+	if c.badURL != nil {
+		return Answers{}, c.badURL
+	}
+	payload, err := q.Body()
+	if err != nil {
+		return Answers{}, err
+	}
+	var as Answers
+	err = c.do(ctx, payload, func(raw []byte) error {
+		var err error
+		as, err = decodeAnswers(q, raw)
+		return err
+	})
+	if err != nil {
+		return Answers{}, err
+	}
+	return as, nil
+}
+
+// do sends payload until decode accepts a reply, waiting for the rate
+// limit before each attempt and backing off between them. A reply decode
+// rejects is retried like a network error.
+func (c *HTTP) do(ctx context.Context, payload []byte, decode func(raw []byte) error) error {
+	tokens := cost(payload)
 	for attempt := 0; ; attempt++ {
 		if err := c.limits.wait(ctx, tokens); err != nil {
-			return Response{}, err
+			return err
 		}
-		model, nouls, err := c.post(ctx, payload, n)
+		raw, err := c.post(ctx, payload)
+		if err == nil {
+			err = decode(raw)
+		}
 		if err == nil {
 			c.limits.recordSuccess()
-			return Response{Model: model, Nouls: perChunk(req, nouls)}, nil
+			return nil
 		}
 		if isThrottled(err) {
 			c.limits.recordThrottle()
 		}
 		if ctx.Err() != nil {
-			return Response{}, ctx.Err()
+			return ctx.Err()
 		}
 		if !retryable(err) || attempt >= c.opts.MaxRetries {
-			return Response{}, err
+			return err
 		}
 		if err := c.clock.sleep(ctx, c.backoff(attempt, err)); err != nil {
-			return Response{}, err
+			return err
 		}
 	}
 }
@@ -271,35 +314,40 @@ const (
 	maxErrorBody = 1 << 10
 )
 
-// post sends payload and reads the model and n answers, q0 to q(n-1).
-func (c *HTTP) post(ctx context.Context, payload []byte, n int) (string, []float64, error) {
+// post sends payload and returns the body of a 2xx reply.
+func (c *HTTP) post(ctx context.Context, payload []byte) ([]byte, error) {
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	hreq.Header.Set("Authorization", "Bearer "+c.key)
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("User-Agent", "jinter")
 	hresp, err := c.http.Do(hreq)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	defer hresp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(hresp.Body, maxBody))
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if hresp.StatusCode/100 != 2 {
 		body := strings.TrimSpace(string(raw))
 		if len(body) > maxErrorBody {
 			body = strings.ToValidUTF8(body[:maxErrorBody], "") + "…"
 		}
-		return "", nil, &statusError{
+		return nil, &statusError{
 			status:     hresp.StatusCode,
 			body:       body,
 			retryAfter: parseRetryAfter(hresp.Header.Get("Retry-After"), c.clock.now()),
 		}
 	}
+	return raw, nil
+}
+
+// decodeNouls reads the model and n noul answers, q0 to q(n-1).
+func decodeNouls(raw []byte, n int) (string, []float64, error) {
 	var rb responseBody
 	if err := json.Unmarshal(raw, &rb); err != nil {
 		return "", nil, fmt.Errorf("reading TypeSafe response: %w", err)
