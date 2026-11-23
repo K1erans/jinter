@@ -96,6 +96,22 @@ func parse(filename string, src []byte, timeout time.Duration) (*gotreesitter.Bo
 // has syntax errors or the parse stops early: at the parser's own work
 // limits or past timeout.
 func parseEntry(entry *grammars.LangEntry, lang *gotreesitter.Language, src []byte, timeout time.Duration) (*gotreesitter.BoundTree, error) {
+	if entry.Name == "swift" {
+		// See swiftUnits: a unit that fails means the whole file fails.
+		units, sl := swiftUnits(src)
+		for _, u := range units {
+			bt, err := parseWhole(entry, lang, u.text(src), timeout)
+			if err != nil {
+				return nil, fmt.Errorf("lines %d-%d on their own: %w", sl.row(u.lo)+1, sl.row(u.hi-1)+1, err)
+			}
+			bt.Release()
+		}
+	}
+	return parseWhole(entry, lang, src, timeout)
+}
+
+// parseWhole is parseEntry without parsing a Swift file's units first.
+func parseWhole(entry *grammars.LangEntry, lang *gotreesitter.Language, src []byte, timeout time.Duration) (*gotreesitter.BoundTree, error) {
 	pool := parserPool(entry.Name, lang, timeout)
 	var tree *gotreesitter.Tree
 	var err error
