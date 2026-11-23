@@ -26,14 +26,16 @@ const DefaultBaseURL = "https://api.typesafe.ai"
 
 // HTTPOptions tune the real client. Zero values take the defaults below.
 //
-// TypeSafe publishes 80 requests/s and 100K tokens/s, but says its limits
-// change without notice; on 2026-10-08 a scan at 4x those ran with no 429s.
-// So the defaults are a ceiling of 4x, and the client backs off on its own
-// when TypeSafe throttles it (see limits).
+// TypeSafe sets rate limits per organization and doesn't say in its replies
+// what they are; it once published 80 requests/s and 100K tokens/s, and on
+// 2026-10-08 a scan at 4x those ran with no 429s. So with the rates left at
+// zero the client starts at 4x, finds the account's rate by trying (up to
+// 10x the start), and backs off when TypeSafe throttles it (see limits).
 type HTTPOptions struct {
 	BaseURL           string        // default DefaultBaseURL
-	TokensPerSecond   float64       // ceiling; default 400,000
-	RequestsPerSecond float64       // ceiling; default 320
+	TokensPerSecond   float64       // fixed ceiling; zero: start at 400,000 and probe up to 4,000,000
+	RequestsPerSecond float64       // fixed ceiling; zero: start at 320 and probe up to 3,200
+	StateFile         string        // if set, and neither rate is, the rate learned is kept here for the next client
 	MaxRetries        int           // default 6; negative means none
 	BaseBackoff       time.Duration // first retry delay, doubled each time; default 500 ms
 	MaxBackoff        time.Duration // default 10 s
@@ -129,8 +131,6 @@ var payloadReaders = sync.Pool{New: func() any { return &payloadReader{} }}
 
 func NewHTTP(apiKey string, opts HTTPOptions) *HTTP {
 	opts.BaseURL = strings.TrimRight(cmp.Or(opts.BaseURL, DefaultBaseURL), "/")
-	opts.TokensPerSecond = cmp.Or(opts.TokensPerSecond, 400_000)
-	opts.RequestsPerSecond = cmp.Or(opts.RequestsPerSecond, 320)
 	opts.MaxRetries = cmp.Or(opts.MaxRetries, 6)
 	opts.BaseBackoff = cmp.Or(opts.BaseBackoff, 500*time.Millisecond)
 	opts.MaxBackoff = cmp.Or(opts.MaxBackoff, 10*time.Second)
@@ -143,7 +143,7 @@ func NewHTTP(apiKey string, opts HTTPOptions) *HTTP {
 		endpoint:   opts.BaseURL + "/v1/systemone",
 		http:       &http.Client{Timeout: opts.Timeout, Transport: newTransport()},
 		clock:      clk,
-		limits:     newLimits(clk, opts.RequestsPerSecond, opts.TokensPerSecond),
+		limits:     newLimits(clk, opts, apiKey),
 	}
 	if u, err := url.Parse(c.endpoint); err != nil {
 		c.badURL = fmt.Errorf("jev: bad BaseURL: %w", err)
@@ -202,10 +202,13 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("TypeSafe API error %d: %s", e.status, e.body)
 }
 
-// isThrottled reports a rate limit (429) or overload (529) reply.
-func isThrottled(err error) bool {
+// throttled returns err's rate limit (429) or overload (529) reply, or nil.
+func throttled(err error) *statusError {
 	var se *statusError
-	return errors.As(err, &se) && (se.status == http.StatusTooManyRequests || se.status == 529)
+	if errors.As(err, &se) && (se.status == http.StatusTooManyRequests || se.status == 529) {
+		return se
+	}
+	return nil
 }
 
 func retryable(err error) bool {
@@ -271,16 +274,17 @@ func (c *HTTP) Decide(ctx context.Context, q Query) (Answers, error) {
 func (c *HTTP) do(ctx context.Context, payload []byte, decode func(raw []byte) error) error {
 	tokens := cost(payload)
 	for attempt := 0; ; attempt++ {
-		if err := c.limits.wait(ctx, tokens); err != nil {
+		epoch, err := c.limits.wait(ctx, tokens)
+		if err != nil {
 			return err
 		}
-		err := c.postAndDecode(ctx, payload, decode)
+		err = c.postAndDecode(ctx, payload, decode)
 		if err == nil {
 			c.limits.recordSuccess()
 			return nil
 		}
-		if isThrottled(err) {
-			c.limits.recordThrottle()
+		if se := throttled(err); se != nil {
+			c.limits.recordThrottle(se.status, se.retryAfter, epoch)
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -699,7 +703,7 @@ func (c *HTTP) postAndDecode(ctx context.Context, payload []byte, decode func(ra
 		return &statusError{
 			status:     hresp.StatusCode,
 			body:       body,
-			retryAfter: parseRetryAfter(hresp.Header.Get("Retry-After"), c.clock.now()),
+			retryAfter: retryAfter(hresp.Header, c.clock.now()),
 		}
 	}
 	return decode(raw)
@@ -1114,6 +1118,18 @@ func (c *HTTP) backoff(attempt int, err error) time.Duration {
 		d = se.retryAfter
 	}
 	return d
+}
+
+// retryAfter is the delay a reply asks for: retry-after-ms (which
+// TypeSafe's SDKs honour alongside Retry-After) if it parses, being the
+// finer of the two, else Retry-After.
+func retryAfter(h http.Header, now time.Time) time.Duration {
+	if v := h.Get("Retry-After-Ms"); v != "" {
+		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 && ms < float64(math.MaxInt64/time.Millisecond) {
+			return time.Duration(ms * float64(time.Millisecond))
+		}
+	}
+	return parseRetryAfter(h.Get("Retry-After"), now)
 }
 
 // parseRetryAfter reads delay-seconds or an HTTP date, as of now.

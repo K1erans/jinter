@@ -529,62 +529,6 @@ func TestDefaultLimitsAreTheProbedCeiling(t *testing.T) {
 	}
 }
 
-func TestThrottlingHalvesTheRateThenItRecovers(t *testing.T) {
-	var throttle atomic.Bool
-	c, clk, _ := serve(t, HTTPOptions{RequestsPerSecond: 100, TokensPerSecond: 1e6, BaseBackoff: time.Millisecond}, func(w http.ResponseWriter, r *http.Request, _ int) {
-		if throttle.Load() {
-			throttle.Store(false)
-			w.Header().Set("Retry-After", "0")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		ok(w)
-	})
-	ask := func() {
-		t.Helper()
-		if _, err := c.Ask(context.Background(), req); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Rounded, since the share is a running float sum.
-	rps := func() float64 { r, _ := c.Limits(); return math.Round(r*1000) / 1000 }
-
-	throttle.Store(true)
-	ask() // a 429, then a success
-	if got := rps(); got != 50 {
-		t.Fatalf("after a 429 the rate should halve to 50, got %v", got)
-	}
-
-	clk.advance(500 * time.Millisecond)
-	throttle.Store(true)
-	ask()
-	if got := rps(); got != 50 {
-		t.Fatalf("429s within a second of a cut are one event, got %v", got)
-	}
-
-	clk.advance(1100 * time.Millisecond)
-	ask()
-	if got := rps(); got != 60 {
-		t.Fatalf("a second without 429s should add 10%% of the ceiling, got %v", got)
-	}
-	for range 10 {
-		clk.advance(1100 * time.Millisecond)
-		ask()
-	}
-	if got := rps(); got != 100 {
-		t.Fatalf("the rate recovers up to the ceiling and stops, got %v", got)
-	}
-
-	for range 10 {
-		clk.advance(1100 * time.Millisecond)
-		throttle.Store(true)
-		ask()
-	}
-	if got := rps(); got != 6.25 {
-		t.Fatalf("the rate never drops below 1/16 of the ceiling, got %v", got)
-	}
-}
-
 // Many callers share one client while TypeSafe throttles some of them; run
 // with -race.
 func TestConcurrentCallersShareOneClient(t *testing.T) {
