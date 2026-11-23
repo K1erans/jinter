@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/bits"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -40,6 +41,11 @@ type HTTPOptions struct {
 	BaseBackoff       time.Duration // first retry delay, doubled each time; default 500 ms
 	MaxBackoff        time.Duration // default 10 s
 	Timeout           time.Duration // per attempt; default 60 s
+
+	// Relay, if set, dials a relay (see ServeRelay) to send calls through,
+	// so they reuse its open connections instead of each process paying
+	// its own TCP and TLS handshake. If it fails, calls go direct.
+	Relay func(ctx context.Context) (net.Conn, error)
 }
 
 // Jev's token count for a request is a fixed overhead plus its payload.
@@ -141,7 +147,7 @@ func NewHTTP(apiKey string, opts HTTPOptions) *HTTP {
 		authHeader: []string{"Bearer " + apiKey},
 		opts:       opts,
 		endpoint:   opts.BaseURL + "/v1/systemone",
-		http:       &http.Client{Timeout: opts.Timeout, Transport: newTransport()},
+		http:       &http.Client{Timeout: opts.Timeout, Transport: transportFor(opts)},
 		clock:      clk,
 		limits:     newLimits(clk, opts, apiKey),
 	}

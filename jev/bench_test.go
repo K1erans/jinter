@@ -38,7 +38,7 @@ func BenchmarkAskParallel(b *testing.B) {
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	defer srv.Close()
 	c := NewHTTP("k", HTTPOptions{BaseURL: srv.URL, RequestsPerSecond: 1e9, TokensPerSecond: 1e12})
-	c.http.Transport.(*http.Transport).TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+	c.http.Transport.(*firstConnGate).rt.(*http.Transport).TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
 	procs := runtime.GOMAXPROCS(0)
 	b.SetParallelism((128 + procs - 1) / procs)
 	b.ReportAllocs()
